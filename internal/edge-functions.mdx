@@ -1,0 +1,104 @@
+---
+title: "Edge Functions"
+description: "The ten Supabase Edge Functions, what they do, and how they are invoked."
+noindex: true
+---
+
+All functions live in `supabase/functions/<name>/index.ts` and run on Deno. Deploy with:
+
+```bash
+npx supabase functions deploy <name> --linked
+npx supabase functions deploy --linked   # all of them
+```
+
+## Invocation model
+
+| Caller | Auth | Functions |
+| --- | --- | --- |
+| Signed-in client | User JWT, forwarded automatically by `supabase.functions.invoke` | `create-checkout-session`, `create-portal-session`, `delete-account`, `join-by-invite`, `process-notifications`, `test-push` |
+| Scheduler | `Authorization: Bearer <SERVICE_ROLE_KEY>` | `chore-daily-job`, `reminder-notifications` |
+| Another function | Service role, internal | `send-push-notification` |
+| Stripe | Signature verification via `STRIPE_WEBHOOK_SECRET` | `stripe-webhook` |
+
+Functions that act on behalf of a user create **two** clients: an admin client with the service-role key for the privileged work, and a user-scoped client with the anon key plus the caller's JWT purely to resolve `auth.uid()`. Read `create-checkout-session/index.ts` for the canonical version of that pattern.
+
+## Notifications
+
+### `process-notifications`
+The dispatcher. Reads unsent, due rows from `notifications` in creation order (batched), and for each one:
+
+<Steps>
+  <Step title="Membership check">
+    If the row has a `flat_id` and the recipient is no longer an `active` member, it is marked `sent = true` and skipped. Leaving a flat stops its notifications immediately.
+  </Step>
+  <Step title="Push enabled check">
+    If `notification_settings.push_enabled` is false, mark sent and skip.
+  </Step>
+  <Step title="Category check">
+    `type` maps to a boolean column: `chores`, `reminders`, `expenses`, `polls`, `todos`, `shopping`. `test` always passes when push is enabled.
+  </Step>
+  <Step title="Deliver">
+    Invoke `send-push-notification` with the title, body, data, icons, and `tag: notification-<id>`.
+  </Step>
+</Steps>
+
+<Note>
+  Skipped notifications are still marked `sent = true`. "Sent" means "the pipeline is finished with this row", not "a device received it". The in-app inbox uses `read`, not `sent`, so a user with push off still sees everything in the bell menu.
+</Note>
+
+### `send-push-notification`
+Does the actual Web Push. Reads every `push_subscriptions` row for the user, signs with `VAPID_PRIVATE_KEY`, and posts to each endpoint. Requires `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `APP_ORIGIN` (or `SITE_URL`) as Edge Function secrets.
+
+Never call this directly for user content. It performs no settings checks - that is `process-notifications`' job.
+
+### `test-push`
+Diagnostic. Takes `{ user_id? }`, queues a notification of type `test`, and immediately invokes `process-notifications`. Because `test` bypasses category filters, a failure here isolates the problem to subscriptions, VAPID, or the service worker rather than to settings.
+
+## Scheduled
+
+### `chore-daily-job`
+Runs once per calendar day. See [Scheduled jobs](/internal/scheduled-jobs) for the full behaviour and cron setup. Accepts `{ "dry_run": true }` to report what it *would* rotate without writing.
+
+### `reminder-notifications`
+Runs every 15 minutes. Selects reminders with `next_notify_at <= now + 30 minutes`, queues a `reminders` notification for each member in `notify_users` (or all members when unset), advances `next_notify_at` for recurring reminders, then invokes `process-notifications`.
+
+## Flats
+
+### `join-by-invite`
+Server-side counterpart to the `join_by_invite` RPC, accepting `{ token }` or `{ short_code }`. It resolves the invite, checks existing membership, and returns the flat. The app currently redeems through the RPC path (`useJoinByToken`); this function remains for server-initiated or out-of-band joins.
+
+### `delete-account`
+Verifies the caller's JWT, calls the `delete_user_account` RPC to clean up application rows, then `auth.admin.deleteUser(user.id)`. Irreversible.
+
+## Billing
+
+### `create-checkout-session`
+Body: `{ price_id, flat_id, success_url, cancel_url }`. Verifies the caller is a member of `flat_id`, reuses or creates the Stripe customer stored on `flats.stripe_customer_id`, and returns `{ url }` for redirect. `flat_id` is written into the subscription metadata, which is what the webhook keys off later.
+
+### `create-portal-session`
+Body: `{ flat_id, return_url }`. Returns a Stripe Billing Portal `{ url }` for the flat's existing customer.
+
+### `stripe-webhook`
+Verifies the signature, then handles subscription lifecycle events. `active` and `trialing` map to `premium`; everything else, including `customer.subscription.deleted`, maps to `free`. It writes `subscription_tier`, the subscription id, and `subscription_expires_at` (from `current_period_end`) onto the flat.
+
+<Warning>
+  Every branch depends on `subscription.metadata.flat_id`. A subscription created outside `create-checkout-session` - by hand in the Stripe dashboard, for example - carries no `flat_id` and the webhook will log and ignore it. If a customer paid and is still on `free`, check the subscription metadata first.
+</Warning>
+
+## Required secrets
+
+Set these per environment under **Project settings → Edge Functions → Secrets**.
+
+| Secret | Used by |
+| --- | --- |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY` | All |
+| `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | `send-push-notification` |
+| `APP_ORIGIN` or `SITE_URL` | `send-push-notification` |
+| `STRIPE_SECRET_KEY` | The three Stripe functions |
+| `STRIPE_WEBHOOK_SECRET` | `stripe-webhook` |
+
+`SUPABASE_URL` and the keys are injected automatically in hosted Supabase. If a function logs `SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set`, it is running somewhere they are not.
+
+## Tests
+
+`chore-daily-job` ships with `getDueDate.test.ts`, covering the timezone-sensitive due-date logic. Run it with `deno test` from the function directory. It is the only unit test in the repo and it earns its place - that function is the one most likely to be wrong in a way nobody notices for a day.

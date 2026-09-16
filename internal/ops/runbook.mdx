@@ -1,0 +1,136 @@
+---
+title: "Runbook"
+description: "Diagnosing the failures that actually happen in FlatApp."
+noindex: true
+---
+
+## Push notifications are not arriving
+
+The pipeline has five stages and each fails differently. Work down the list; stop at the first one that is wrong.
+
+<Steps>
+  <Step title="Is anything queued?">
+    ```sql
+    SELECT id, user_id, type, title, sent, scheduled_at, created_at
+    FROM notifications ORDER BY created_at DESC LIMIT 20;
+    ```
+    No rows means the producer never fired - a trigger or a scheduled job, not push. Go look there instead.
+  </Step>
+  <Step title="Queued but sent = false">
+    Nothing invoked `process-notifications`. Triggers only queue. Invoke it manually and see whether the rows drain.
+  </Step>
+  <Step title="sent = true but nothing arrived">
+    Almost always a settings skip. `process-notifications` marks skipped rows as sent.
+    ```sql
+    SELECT push_enabled, chores, expenses, reminders, polls, todos, shopping
+    FROM notification_settings WHERE user_id = '...';
+    ```
+  </Step>
+  <Step title="Settings fine, still nothing">
+    Check the device subscription.
+    ```sql
+    SELECT endpoint, last_used_at FROM push_subscriptions WHERE user_id = '...';
+    ```
+    No rows means the user never granted permission or the subscription was dropped. A stale `last_used_at` suggests an expired endpoint - `usePushSubscriptionSync` should be re-registering it at app start.
+  </Step>
+  <Step title="Subscription exists, still nothing">
+    VAPID mismatch. The `VITE_VAPID_PUBLIC_KEY` compiled into the bundle must pair with `VAPID_PRIVATE_KEY` in that environment's Edge Function secrets. After changing either, every existing subscription is dead and users must re-enable notifications.
+  </Step>
+</Steps>
+
+Fast isolation: invoke `test-push` for the user. It queues type `test`, which bypasses category filters. If the test arrives but real notifications do not, the problem is settings or the producer. If the test does not arrive either, it is subscriptions, VAPID, or the service worker.
+
+```js
+// In the browser console, on the app
+window.__debugNotifications()
+```
+
+## Chores are not rotating
+
+<Steps>
+  <Step title="Is the chore eligible?">
+    ```sql
+    SELECT id, title, recurrence, rotation_members, current_assignee_index, last_rotated_at
+    FROM chores WHERE id = '...';
+    ```
+    Needs `recurrence != 'none'` **and** a non-empty `rotation_members`. Failing either is the most common answer.
+  </Step>
+  <Step title="Is the job running?">
+    ```sql
+    SELECT name, timezone, last_chore_job_processed_date FROM flats;
+    ```
+    An old date means the scheduler is not reaching the function. Check the cron service, and if you use pg_cron, check both `cron.job` and the Vault secrets - a missing Vault secret fails silently.
+  </Step>
+  <Step title="Is it actually due?">
+    ```bash
+    curl -X POST '.../functions/v1/chore-daily-job' \
+      -H 'Authorization: Bearer SERVICE_ROLE_KEY' \
+      -H 'Content-Type: application/json' -d '{"dry_run": true}'
+    ```
+    The response lists `would_rotate` per chore. A chore missing from it is not due by `getDueDate` - check `last_rotated_at`, `recurrence_interval`, `day_of_week`, and the flat's timezone.
+  </Step>
+  <Step title="Rotation happening, notifications not">
+    Different gate. Notifications need local hour >= 9 and `last_chore_job_processed_date != today`. Rotation has no such gate.
+  </Step>
+</Steps>
+
+## Reminders are silent
+
+```sql
+SELECT id, title, date, recurrence, next_notify_at, notified FROM reminders WHERE flat_id = '...';
+```
+
+`next_notify_at IS NULL` means it will never fire, whatever the other columns say. A large backlog of past `next_notify_at` values means the 15-minute cron has stalled - they will all fire on the next successful run rather than being skipped.
+
+## A balance looks wrong
+
+<Steps>
+  <Step title="Check the split assumption">
+    `split_between` excludes the payer. A $30 expense with two others listed is $10 each across three people. This accounts for most "wrong balance" reports.
+  </Step>
+  <Step title="Inspect settlement_status">
+    ```sql
+    SELECT id, title, amount, settled, settlement_status FROM expenses WHERE id = '...';
+    ```
+    `settled` should be true only when every array entry reads `settled`. If they disagree, something wrote `settled` directly instead of going through `confirm_settlement_batch`.
+  </Step>
+  <Step title="Check itemised totals">
+    `itemized_details` amounts should sum to `amount`. `validateItemizedTotal` guards the form, but data predating it may not comply.
+  </Step>
+</Steps>
+
+## Realtime stopped updating
+
+| Check | How |
+| --- | --- |
+| Table is published | `SELECT * FROM pg_publication_tables WHERE pubname = 'supabase_realtime';` |
+| Subscription is bound | Network tab, websocket frames |
+| Keys match | Invalidated key must equal the `useQuery` key; both from `queryKeys` |
+| Channels leaking | Unstable hook dependencies resubscribe every render and eventually exhaust the connection limit |
+
+## RLS denial
+
+```text
+new row violates row-level security policy for table "x"
+```
+
+The caller is not an active member of that flat, or the policy is missing for that verb. Check `flat_members` for `status = 'active'`, then check whether a policy covers the operation you are attempting - `FOR SELECT` alone does not permit an insert.
+
+If a **read** returns zero rows rather than erroring, that is RLS working as designed. Emptiness is the correct denial for a select.
+
+## Vercel build fails, local is fine
+
+`npm run check`. The dev server does not typecheck; the Vercel build runs `tsc -b` first.
+
+## Someone paid but is still on the free tier
+
+Check `subscription.metadata.flat_id` in Stripe. `stripe-webhook` skips any subscription without it, which is every subscription not created through `create-checkout-session`.
+
+## Escalation
+
+| Symptom | Likely area | Page |
+| --- | --- | --- |
+| Nothing anywhere for one user | Subscriptions or settings | [Notification pipeline](/internal/notifications-pipeline) |
+| Nothing for everyone in one flat | Flat timezone or the job gate | [Scheduled jobs](/internal/scheduled-jobs) |
+| Nothing since a deploy | VAPID or secrets | [Environments](/internal/ops/environments) |
+| Data missing for one user only | RLS or membership status | [Security and RLS](/internal/security-rls) |

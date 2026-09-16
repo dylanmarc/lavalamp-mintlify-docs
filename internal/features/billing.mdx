@@ -1,0 +1,81 @@
+---
+title: "Billing"
+description: "Stripe subscription plumbing, and what is and is not wired up yet."
+noindex: true
+---
+
+**Hook:** `src/hooks/useSubscription.ts` · **Functions:** `create-checkout-session`, `create-portal-session`, `stripe-webhook`
+
+## Current state
+
+<Warning>
+  The billing pipeline is complete end to end, but **nothing in the app gates on it**. `isPremium` is computed and never read. Subscribing today changes a column and nothing else. Treat this as scaffolding that works, not as a live paywall.
+</Warning>
+
+A grep for `isPremium` returns only its own definition. Before launching a paid tier, someone has to decide what premium actually buys and add the gates.
+
+## Where the state lives
+
+Subscription is a property of the **flat**, not the user. One person pays and the whole household benefits.
+
+| Column on `flats` | Meaning |
+| --- | --- |
+| `subscription_tier` | `free` or `premium` |
+| `subscription_expires_at` | From the Stripe period end |
+| `stripe_customer_id` | Reused across checkouts |
+
+```ts
+const { isPremium, tier, expiresAt, hasStripeCustomer } = useSubscription();
+```
+
+The hook reads those three columns for the active flat. `tier` defaults to `'free'` when the row is null.
+
+## Checkout
+
+```ts
+const { url } = await useCreateCheckoutSession().mutateAsync({ flatId, priceId });
+window.location.href = url;
+```
+
+`create-checkout-session` verifies the caller is a member of `flat_id`, reuses or creates the Stripe customer, and writes `flat_id` into the **subscription metadata**. Success and cancel URLs point back at `/settings`.
+
+## The billing portal
+
+`create-portal-session` returns a Stripe-hosted portal URL for the flat's existing customer. Plan changes, payment method updates, and cancellation all happen there rather than in FlatApp, which keeps card data entirely out of the app.
+
+## The webhook
+
+`stripe-webhook` verifies the signature against `STRIPE_WEBHOOK_SECRET`, then:
+
+| Event | Result |
+| --- | --- |
+| `customer.subscription.created` / `.updated` with status `active` or `trialing` | `premium`, with the subscription id and `current_period_end` |
+| Same events, any other status | `free` |
+| `customer.subscription.deleted` | `free`, ids cleared |
+| Anything else | Logged and ignored |
+
+<Warning>
+  Every branch keys off `subscription.metadata.flat_id`. A subscription created outside `create-checkout-session` - by hand in the Stripe dashboard, or migrated from elsewhere - has no `flat_id`, so the webhook logs and skips it and the flat stays on `free`. If someone has paid and is not premium, check the metadata before anything else.
+</Warning>
+
+## Secrets
+
+| Secret | Used by |
+| --- | --- |
+| `STRIPE_SECRET_KEY` | All three functions |
+| `STRIPE_WEBHOOK_SECRET` | `stripe-webhook` |
+
+Both are Edge Function secrets, per environment. Staging must point at Stripe test mode with its own webhook endpoint and its own signing secret; a production signing secret against test events fails verification and the webhook silently 400s.
+
+## Testing
+
+```bash
+stripe listen --forward-to https://YOUR_PROJECT_REF.supabase.co/functions/v1/stripe-webhook
+stripe trigger customer.subscription.created
+```
+
+A triggered event carries no `flat_id`, so expect the skip path. To test the happy path properly, run a real test-mode checkout through `create-checkout-session` so the metadata is attached.
+
+## If you add gating
+
+Read `useSubscription()` at the feature boundary, not deep in a component tree, and remember the client-side check is cosmetic. Anything that must actually be restricted needs an RLS policy or an RPC check against `flats.subscription_tier`, because the browser can be told anything.

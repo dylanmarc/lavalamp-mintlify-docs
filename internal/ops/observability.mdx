@@ -1,0 +1,80 @@
+---
+title: "Observability"
+description: "What FlatApp reports, and the queries to run when it does not."
+noindex: true
+---
+
+## What exists
+
+| Source | Covers |
+| --- | --- |
+| Sentry (`@sentry/react`) | Client exceptions and unhandled rejections |
+| Supabase Edge Function logs | Every `console.log` and thrown error in a function |
+| Supabase Postgres logs | Slow queries, RLS denials, errors |
+| Vercel build and runtime logs | Deploy failures, static serving |
+| Cron provider logs | Whether the scheduler actually fired |
+
+## What does not exist
+
+<Warning>
+  There is no alerting. Nothing pages anyone when the notification queue stops draining or the chore job stops running. Both failures are silent from a user's point of view - the app looks fine and simply stops doing time-based work. Until alerting exists, the health queries below are the check, and someone has to run them.
+</Warning>
+
+There are also no product analytics and no uptime monitor.
+
+## Health queries
+
+```sql
+-- Queue draining? A number that only grows means the processor is not running.
+SELECT count(*) FROM notifications WHERE sent = false;
+
+-- Oldest unsent. More than an hour old is a problem.
+SELECT id, type, title, created_at
+FROM notifications WHERE sent = false
+ORDER BY created_at ASC LIMIT 10;
+
+-- Chore job alive? Every flat should show today's local date.
+SELECT name, timezone, last_chore_job_processed_date FROM flats ORDER BY name;
+
+-- Rotation moving?
+SELECT title, last_rotated_at FROM chores
+WHERE recurrence <> 'none' ORDER BY last_rotated_at ASC LIMIT 10;
+
+-- Reminder backlog.
+SELECT count(*) FROM reminders WHERE next_notify_at < now() - interval '1 hour';
+
+-- Devices registered. A sharp drop means subscriptions are being invalidated.
+SELECT count(*) AS devices, count(DISTINCT user_id) AS users FROM push_subscriptions;
+
+-- Signups and flat creation over the last week.
+SELECT date_trunc('day', created_at) AS day, count(*)
+FROM users_profile WHERE created_at > now() - interval '7 days'
+GROUP BY 1 ORDER BY 1;
+```
+
+<Tip>
+  Save these as a Supabase Studio snippet named "FlatApp health". Running them takes under a minute and catches every silent failure this system has.
+</Tip>
+
+## Reading Edge Function logs
+
+**Dashboard → Edge Functions → \<name\> → Logs.** The functions log deliberately:
+
+- `chore-daily-job` logs rotation results and errors per chore.
+- `process-notifications` logs each skip with its reason, which is usually the answer to "why did this not arrive".
+- `send-push-notification` logs per-endpoint failures.
+- `stripe-webhook` logs every event type it sees, including the ones it ignores.
+
+## Sentry
+
+Initialised in `src/lib/sentry.ts`. Worth knowing when triaging:
+
+- Network failures from a phone on a bad connection are noise, not bugs.
+- An RLS denial reaching Sentry usually means a missing `enabled:` guard let a query run before the flat resolved.
+- Service worker errors often reflect a stale cached worker on the user's device rather than the current deploy.
+
+## If you add monitoring
+
+The highest-value alert by a distance is **unsent notifications older than one hour**. It catches a stalled processor, a dead cron, and a broken Edge Function deploy in one signal, and every one of those is currently invisible until a user complains.
+
+Second is a **drop in daily active `push_subscriptions`**, which is the earliest sign of a VAPID or service worker regression.

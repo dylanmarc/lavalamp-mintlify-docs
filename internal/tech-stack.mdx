@@ -1,0 +1,60 @@
+---
+title: "Tech stack"
+description: "Libraries FlatApp depends on and why each one is there."
+noindex: true
+---
+
+## Frontend
+
+| Area | Choice | Notes |
+| --- | --- | --- |
+| Framework | React 19 | `react` / `react-dom` 19.1 |
+| Language | TypeScript 5.9 | Strict; project references via `tsconfig.app.json` and `tsconfig.node.json` |
+| Build | Vite 6 | `@` is aliased to `/src` |
+| Routing | React Router 7 | Nested routes; auth gate in `ProtectedRoute` |
+| Server state | TanStack Query 5 | All Supabase reads and writes |
+| Client state | Zustand 5 | Theme, UI, expense filters, notification panel |
+| Styling | TailwindCSS 3.4 | `darkMode: 'class'` |
+| Forms | React Hook Form + Zod 4 | `@hookform/resolvers` |
+| Dates | Luxon + date-fns | Luxon for timezone-aware logic, date-fns for display formatting |
+| Charts | Recharts 3 | Dashboard chore timeline |
+| Icons | Lucide React | |
+| Toasts | Sonner | Wrapped by `src/lib/toast.ts` |
+| Drag and drop | dnd-kit | Reordering shopping and todo items |
+| Virtualisation | TanStack Virtual | Long lists |
+| PWA | vite-plugin-pwa + Workbox | Custom push handler in `public/sw-push-handler.js` |
+| Errors | Sentry (`@sentry/react`) | Configured in `src/lib/sentry.ts` |
+
+## Backend
+
+| Area | Choice |
+| --- | --- |
+| Database | Supabase Postgres 17 |
+| Authorisation | Row Level Security, plus `SECURITY DEFINER` functions |
+| Auth | Supabase Auth (email and password, with reset flow) |
+| Live updates | Supabase Realtime (`postgres_changes`) |
+| Serverless | Supabase Edge Functions (Deno) |
+| Push | Web Push with VAPID |
+| Payments | Stripe (Checkout and Billing Portal) |
+
+## Tooling
+
+| Command | What it does |
+| --- | --- |
+| `npm run dev` | Vite dev server on port 5173 |
+| `npm run dev:local` | `supabase start` and Vite together |
+| `npm run dev:tunnel` | Vite plus a localtunnel URL, for push testing on a real phone |
+| `npm run check` | `eslint .` then `tsc -b` - run this before every push |
+| `npm run build` | `tsc -b && vite build` into `dist/` |
+| `npm run db:reset` | `supabase db reset`, replaying all migrations locally |
+| `npm run db:migrate` | `supabase migration new` |
+| `npm run use:local` / `use:prod` | Swap `.env.local` between backends |
+| `npm run screenshots` | Puppeteer capture script in `scripts/` |
+
+<Warning>
+  `npm run check` is the gate. TypeScript errors do not fail the Vite dev server, so a branch can look healthy locally and still break the Vercel build, which runs `tsc -b` first.
+</Warning>
+
+## Version pinning notes
+
+`package.json` carries `overrides` for `axios`, `debug`, `follow-redirects`, and `yargs-parser`. These exist to pull transitive dependencies past known advisories. Do not drop them without checking `npm audit` first.

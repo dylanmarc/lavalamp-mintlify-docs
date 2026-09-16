@@ -1,0 +1,119 @@
+---
+title: "Deployment"
+description: "Shipping frontend, database, and Edge Function changes safely."
+noindex: true
+---
+
+Deployment has three independent tracks, and the order between them matters.
+
+| Track | Mechanism | Trigger |
+| --- | --- | --- |
+| Frontend | Vercel | Push to `main` (production) or any branch (preview) |
+| Database | `supabase db push --linked` | Manual |
+| Edge Functions | `supabase functions deploy --linked` | Manual |
+
+<Warning>
+  **Database first, always.** Vercel deploys automatically on merge; migrations do not. Merging a frontend that reads a column production does not have yet breaks the app between the merge and your `db push`.
+</Warning>
+
+## Frontend only
+
+```bash
+npm run check
+npm run build
+
+git add .
+git commit -m "feat: ..."
+git push origin develop
+# PR develop → staging, verify on the preview, then staging → main
+```
+
+Vercel builds production on merge to `main`.
+
+## With database changes
+
+<Steps>
+  <Step title="Verify locally">
+    ```bash
+    npx supabase db reset
+    npm run use:local && npm run dev
+    ```
+    A full reset proves the migration works from scratch, not just as a delta against your current local state.
+  </Step>
+  <Step title="Push migrations to staging">
+    ```bash
+    npx supabase db push --linked
+    ```
+    Confirm the link points at staging first: `npx supabase projects list`.
+  </Step>
+  <Step title="Deploy the frontend to staging">
+    Merge into `staging` and exercise the changed feature on the preview URL.
+  </Step>
+  <Step title="Push migrations to production">
+    Re-link to production, `db push`, and verify the schema landed.
+  </Step>
+  <Step title="Merge to main">
+    Vercel deploys. The schema is already ahead of the code, which is the safe direction.
+  </Step>
+</Steps>
+
+Write migrations so the old frontend survives them. Additive changes (new nullable column, new table) are safe in either order. A rename or a drop is not, and needs the two-step: add the new shape, ship code that writes both, backfill, then drop in a later release.
+
+## Edge Functions
+
+```bash
+npx supabase functions deploy chore-daily-job --linked   # one
+npx supabase functions deploy --linked                    # all
+```
+
+Functions do not version with the frontend. If a function and the client change together, deploy the function first if it is backward compatible, and stage the change over two releases if it is not.
+
+Check secrets exist in the target environment before deploying something that reads a new one - a missing secret reads as an empty string, and most of these functions will run and fail rather than refuse to start.
+
+## Pre-deploy checklist
+
+<Steps>
+  <Step title="npm run check passes">
+    Lint and typecheck. Vercel runs `tsc -b` and will fail the build otherwise.
+  </Step>
+  <Step title="npm run build passes">
+    Catches things the dev server tolerates.
+  </Step>
+  <Step title="Migrations replay from empty">
+    `npx supabase db reset` locally.
+  </Step>
+  <Step title="Types match the schema">
+    `src/types/index.ts` updated alongside any column change.
+  </Step>
+  <Step title="Secrets present in the target environment">
+    Especially for a function reading something new.
+  </Step>
+  <Step title="Tested with two accounts">
+    Anything touching settlements, rotation, or notifications needs a second member to be meaningfully tested.
+  </Step>
+  <Step title="Both themes checked">
+    Light and dark.
+  </Step>
+  <Step title="Checked on a phone-width viewport">
+    This is a mobile-first app used mostly on phones.
+  </Step>
+</Steps>
+
+## Rollback
+
+| What broke | How to roll back |
+| --- | --- |
+| Frontend | Vercel dashboard → previous deployment → Promote to Production. Seconds. |
+| Edge Function | Redeploy the previous code from git. |
+| Migration | There is no down migration. Write a new forward migration that reverses the change. |
+
+<Warning>
+  Migrations are append-only and there is no automated rollback. This is the strongest argument for making them additive and reversible by construction: an added nullable column can be ignored, a dropped one cannot be un-dropped.
+</Warning>
+
+## After deploying
+
+- Watch Sentry for a spike in the first few minutes.
+- If you touched a scheduled job, invoke it manually once (use `dry_run` for the chore job) rather than waiting for the cron.
+- If you touched notifications, send a `test-push` to yourself.
+- Confirm `SELECT count(*) FROM notifications WHERE sent = false` is not climbing.

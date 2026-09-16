@@ -1,0 +1,90 @@
+---
+title: "Realtime"
+description: "How live updates work, and the Postgres changes limitation the hook exists to work around."
+noindex: true
+---
+
+## `useSupabaseRealtime`
+
+One hook covers every flat-scoped table (`src/lib/useSupabaseRealtime.ts`).
+
+```ts
+useSupabaseRealtime({
+  table: 'expenses',
+  flatId: flat.id,
+  queryKeyBase: queryKeys.expensesAll,
+  debounceMs: 300,
+});
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `table` | required | Postgres table to watch |
+| `flatId` | required | Used for the channel name and for matching incoming rows |
+| `queryKeyBase` | required | Prefix key, for example `['expenses']` |
+| `filterColumn` | `'flat_id'` | Column compared against `flatId` |
+| `enabled` | `true` | Skip subscribing |
+| `debounceMs` | `0` | Coalesce rapid invalidations |
+
+## Why it subscribes without a server-side filter
+
+Supabase `postgres_changes` has a limitation that shapes this entire hook: **when you supply a `filter`, DELETE events stop firing.** INSERT and UPDATE still arrive, so a filtered subscription looks like it works right up until someone deletes a row and every other member's list keeps showing it.
+
+So the hook subscribes unfiltered and discriminates in the callback:
+
+```ts
+if (eventType === 'DELETE') {
+  invalidate(queryKeyBase);          // broad - the deleted row's flat_id is gone
+  return;
+}
+const recordFlatId = payload.new?.[filterColumn];
+if (recordFlatId) {
+  invalidate([...queryKeyBase, recordFlatId]);  // narrow
+}
+```
+
+DELETE payloads do not carry the old row's columns, so there is no `flat_id` to compare against. Invalidating the base key refetches every flat variant in the cache. In practice a client only holds one flat's data, so the cost is one refetch.
+
+<Note>
+  The trade-off is that the client receives events for rows in other flats. It never reads them - it only invalidates a key and refetches through the normal RLS-checked path. No data crosses a flat boundary via Realtime.
+</Note>
+
+## Debouncing
+
+`debounceMs` exists for tables with optimistic mutations. Without it, your own write can produce a Realtime event that invalidates the key mid-mutation, refetching server state that has not caught up yet and flashing the pre-mutation value for a frame. A few hundred milliseconds lets `onSettled` win the race.
+
+Use it on high-churn interactive tables (expenses, shopping items, todos) and leave it at 0 for tables that change rarely.
+
+## Channel naming
+
+`realtime-${table}-${flatId}`. Unique per table per flat, so two components watching the same table share the same subscription rather than opening two. The `useEffect` cleanup calls `supabase.removeChannel(channel)` - leaking channels eventually exhausts the Realtime connection limit and new subscriptions silently fail to bind.
+
+## Enabling Realtime on a new table
+
+Realtime is opt-in per table. In a migration:
+
+```sql
+ALTER PUBLICATION supabase_realtime ADD TABLE public.my_table;
+```
+
+See `20250130000000_expenses_realtime.sql` for the pattern. Forgetting this is the usual cause of "my hook is subscribed but nothing ever fires" - the subscription succeeds, there is simply nothing publishing.
+
+## Debugging checklist
+
+<AccordionGroup>
+  <Accordion title="Nothing fires at all">
+    Is the table in the `supabase_realtime` publication? Check `SELECT * FROM pg_publication_tables WHERE pubname = 'supabase_realtime';`
+  </Accordion>
+  <Accordion title="Inserts and updates work, deletes do not">
+    Someone added a `filter` back to the subscription config. Remove it.
+  </Accordion>
+  <Accordion title="Events fire but the UI does not change">
+    The invalidated key does not match the query key. Both must come from `queryKeys`.
+  </Accordion>
+  <Accordion title="UI flickers back to old values after a write">
+    Add or increase `debounceMs` for that table.
+  </Accordion>
+  <Accordion title="Works for a while, then stops">
+    Channels are leaking. Confirm every `useEffect` returns the `removeChannel` cleanup and that dependencies are stable - an unstable `queryKeyBase` array will resubscribe on every render.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,170 @@
+---
+title: "Gamification"
+description: "XP, levels, coins, cases, cosmetics, bounties, badges, and streaks."
+noindex: true
+---
+
+**Routes:** `/profile/:userId`, `/inventory`, `/cosmetic-preview` · **Hooks:** `useXP`, `useCases`, `useInventory`, `useBounties`, `useBadges`, `useDailyBonus`, `useEquippedCosmetics`
+
+The reward layer exists to make chore completion feel worth doing. Every value below is tuned, has been rebalanced at least once, and lives in **two** places - Postgres and a TypeScript constants file. Keep them in sync.
+
+## Two currencies
+
+| | XP | Coins |
+| --- | --- | --- |
+| Column | `users_profile.total_xp` | `users_profile.coins` |
+| Earned from | Chores, bounties | Chores, bounties, daily bonus, scrapping duplicates |
+| Spent on | Nothing - it only accumulates | Cases, at 100 coins each |
+| Reduced by lateness | Yes | No |
+| Drives | Level, XP badges | Case purchases |
+
+## Levels
+
+Twenty levels, thresholds in `src/lib/xpConstants.ts`:
+
+```ts
+export const LEVEL_THRESHOLDS = [
+  0, 250, 600, 1100, 1800, 2700, 3800, 5200, 6900, 9000,
+  11500, 14500, 18000, 22000, 27000, 33000, 40000, 48000, 57000, 67000,
+];
+```
+
+Names run from Newbie through Flat GOAT at 10 to Transcendent at 20, each with a colour and background class. `getLevelFromXP(xp)` returns `{ level, name, currentXP, nextLevelXP, progress, color, bgColor }`.
+
+`highest_level_reached` is tracked separately so a level never visibly goes backwards. `calculate_level_from_xp` and the `trg_sync_xp_fn` trigger keep `level` in step with `total_xp` server-side.
+
+<Warning>
+  Thresholds exist in SQL (`calculate_level_from_xp`) and in TypeScript (`LEVEL_THRESHOLDS`). They were rescaled in `20260312000006_rescale_level_thresholds.sql`. Change one without the other and the progress bar disagrees with the badge.
+</Warning>
+
+## Chore and bounty rewards
+
+```ts
+// src/lib/bountyConstants.ts
+export const CHORE_REWARDS = {
+  easy:   { xp: 50,  coins: 10 },
+  medium: { xp: 100, coins: 25 },
+  hard:   { xp: 200, coins: 50 },
+};
+
+export const BOUNTY_REWARDS = {
+  easy:   { xp: 1, coins: 5  },
+  medium: { xp: 2, coins: 10 },
+  hard:   { xp: 3, coins: 15 },
+};
+```
+
+Bounty XP is roughly 1/50th of chore XP, deliberately. Bounties are optional extras that a flat defines for itself; if they paid competitively, a flat could mint XP by creating trivial bounties. Coins are more generous because coins only buy cosmetics.
+
+Bounties are claimable **once per user per bounty per day**, enforced by `claim_bounty` against `bounty_completions.completed_date`.
+
+## Late XP
+
+```ts
+const lateMult = daysLate > 0 ? Math.max(0.20, 1.0 - 0.20 * daysLate) : 1.0;
+return Math.max(1, Math.round(baseXP * lateMult));
+```
+
+20% off per day late, floored at 20% of base and at 1 XP absolute. `recalc_late_completion_xp` applies it when a `missed` row becomes `completed_late`.
+
+## Daily login bonus
+
+`claim_daily_login_bonus(p_user_id, p_flat_id, p_date)` - one spin per user per flat per local day, recorded in `daily_login_claims`.
+
+| Segment | Roll range | Coins | Cases | Chance |
+| --- | --- | --- | --- | --- |
+| A | 0-40 | 5 | 0 | 40% |
+| B | 40-65 | 10 | 0 | 25% |
+| C | 65-80 | 25 | 0 | 15% |
+| D | 80-90 | 50 | 0 | 10% |
+| E | 90-95 | 100 | 0 | 5% |
+| F | 95-97 | 200 | 0 | 2% |
+| G | 97-99.5 | 25 | 1 | 2.5% |
+| H | 99.5-100 | 50 | 10 | 0.5% |
+
+Expected value is roughly 26 coins plus 0.075 cases per day. Returns `{ already_claimed: true }` on a repeat and raises for a non-member.
+
+## Cases and cosmetics
+
+### Opening
+
+`open_reward_case(p_user_id)` requires `cases_available > 0`, decrements it, then rolls `random() * 110`:
+
+| Rarity | Weight | Actual chance | Scrap value |
+| --- | --- | --- | --- |
+| Common | 50 | 45.5% | 25 |
+| Uncommon | 30 | 27.3% | 50 |
+| Rare | 15 | 13.6% | 100 |
+| Epic | 10 | 9.1% | 200 |
+| Legendary | 5 | 4.5% | 500 |
+
+The weights sum to 110, so the percentages are not the round numbers the weights imply. That is the shipped behaviour; if you "fix" it to 100, every drop rate changes.
+
+Duplicates do **not** auto-convert to coins (`20260310000008_no_auto_coins_on_duplicate.sql`). The player scraps them by hand via `scrap_item`, which is a deliberate engagement choice, not an oversight.
+
+### Buying
+
+`buy_case(p_user_id, p_quantity)` at 100 coins each, mirrored as `CASE_PRICE` in `src/hooks/useCases.ts`. The hook optimistically deducts coins in `onMutate` and rolls back on error, so the two prices must match.
+
+### Slots
+
+Five cosmetic slots on `users_profile`:
+
+| Slot | Column | Rendering |
+| --- | --- | --- |
+| `title` | `equipped_title` | Text next to the name |
+| `avatar_color` | `equipped_color` | Avatar background |
+| `avatar_frame` | `equipped_frame` | `FRAME_STYLES_RING_4` / `RING_2` in `xpConstants.ts` |
+| `profile_effect` | `equipped_effect` | Animated CSS class |
+| `avatar_emoji` | `equipped_emoji` | Emoji badge |
+
+`equip_cosmetic(p_user_id, p_slot, p_item_id)` verifies ownership in `user_inventory`; passing `NULL` unequips.
+
+Frames come in two ring widths because avatars render at two sizes. A new frame needs an entry in **both** maps - a frame present in only one silently renders unstyled at that size. Special frames (`galaxy_ring`, `rainbow`, `holographic`, `electric`, `lightning`, `prismatic_ring`, `inferno`, `void_ring`, `celestial`, `plasma_ring`) map to CSS classes rather than Tailwind ring utilities.
+
+`/cosmetic-preview` renders the full catalogue for visual QA.
+
+## Badges
+
+Static catalogue in `badges`, awarded into `user_badges` per user per flat by `check_and_award_badges(p_user_id, p_flat_id, p_total_xp, p_streak_weeks, p_total_completions)`. Idempotent.
+
+| Category | Badges |
+| --- | --- |
+| Streak | Getting Started (1w), On a Roll (2w), Hot Streak (4w), Unstoppable (8w), Legendary (12w) |
+| XP | Beginner (100), Contributor (500), Dedicated (1,000), XP Master (2,500), XP Legend (5,000) |
+| Milestone | First Steps (1 chore), Half Century (50), Centurion (100) |
+| Bounty | Added in `20260311000001_bounty_badges.sql` |
+
+Icons map through `BADGE_ICONS` in `xpConstants.ts`.
+
+## Streaks
+
+`evaluate_streak(p_user_id, p_flat_id)` - per user per flat, evaluated at most once per ISO week.
+
+```sql
+IF p_user_id != auth.uid() THEN
+  RETURN jsonb_build_object('evaluated', false, 'error', 'unauthorized');
+END IF;
+```
+
+It locks the `user_streaks` row `FOR UPDATE`, short-circuits if `last_evaluated_at` is already in the current ISO week, and breaks the streak if the user has incomplete recurring chores assigned to them in that flat.
+
+The important subtlety, from `20260310000004_fix_streak_logic.sql`: a week in which the user had **no** assigned chores does not break the streak. Evaluating against "completions since `last_evaluated_at`" rather than "completions this calendar week" is what makes that work. Before the fix, going away for a week you weren't rostered lost your streak.
+
+`user_streaks.last_bonus_month` (`20260414000004`) prevents a monthly streak bonus paying twice.
+
+## Where constants live
+
+| Constant | SQL | TypeScript |
+| --- | --- | --- |
+| Level thresholds | `calculate_level_from_xp` | `LEVEL_THRESHOLDS` |
+| Chore rewards | `trg_chore_coins_fn`, XP triggers | `CHORE_REWARDS` |
+| Bounty rewards | `claim_bounty` | `BOUNTY_REWARDS` |
+| Scrap values | `scrap_item` | `SCRAP_VALUES` |
+| Case price | `buy_case` | `CASE_PRICE` |
+| Case odds | `open_reward_case` | Not mirrored |
+| Wheel segments | `claim_daily_login_bonus` | Not mirrored |
+
+<Note>
+  Server values are authoritative; the client copies exist for optimistic UI and for display. A mismatch shows up as a number that changes after a refresh, which reads to users as the app cheating them. Change both halves in the same commit.
+</Note>

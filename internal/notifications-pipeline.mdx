@@ -1,0 +1,155 @@
+---
+title: "Notification pipeline"
+description: "The queue-then-process contract every FlatApp notification must follow."
+noindex: true
+---
+
+## The contract
+
+<Card title="Queue, then process" icon="list-check">
+  Every user-facing notification is inserted into `notifications` with `sent = false`, and delivered by `process-notifications`. Nothing bypasses this.
+</Card>
+
+The shape is always `(user_id, type, title, body?, data?, flat_id?)`.
+
+| Field | Meaning |
+| --- | --- |
+| `user_id` | Recipient's auth user id |
+| `type` | Category, used for settings and routing: `chores`, `reminders`, `expenses`, `polls`, `todos`, `shopping`, `general`, `test` |
+| `title` | Push title; required |
+| `body` | Push body; may be null |
+| `data` | JSONB for the client, for example `{ "chore_id": "...", "type": "chore_assigned" }` |
+| `flat_id` | In-app context, and the key for the active-membership check at send time |
+| `scheduled_at` | Optional. Delivery is held until this time; `process-notifications` only selects rows where it is null or in the past |
+
+## Why it is a single pipeline
+
+Three things need to happen for every notification, and each one is easy to forget if senders are scattered:
+
+1. **Authorisation.** The sender must not decide who may receive a notification. Queueing happens in triggers and Edge Functions that already know the flat context.
+2. **Per-user and per-category settings.** Checked once, in `process-notifications`, against `notification_settings`.
+3. **Durability.** The row survives whether or not push delivery works, so the in-app bell is always correct.
+
+## How to queue
+
+<Tabs>
+  <Tab title="From an Edge Function">
+```ts
+await supabase.rpc('queue_notification', {
+  p_user_id: recipientId,
+  p_type: 'chores',
+  p_title: 'Chore overdue',
+  p_body: `${chore.title} was due yesterday`,
+  p_data: { chore_id: chore.id, type: 'chore_overdue' },
+  p_flat_id: chore.flat_id,
+});
+
+// Then, if this run should deliver immediately:
+await supabase.functions.invoke('process-notifications', { body: {} });
+```
+  </Tab>
+  <Tab title="From a database trigger">
+```sql
+CREATE OR REPLACE FUNCTION public.notify_something()
+RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+  PERFORM queue_notification(
+    NEW.user_id,
+    'expenses',
+    'New expense added',
+    NEW.title,
+    jsonb_build_object('expense_id', NEW.id),
+    NEW.flat_id
+  );
+  RETURN NEW;
+END;
+$$;
+```
+  </Tab>
+  <Tab title="From the app">
+Do not. The frontend has no authority to decide who receives a notification. Trigger the event that a DB trigger or Edge Function already watches, and invoke `process-notifications` afterwards if the send needs to be prompt.
+  </Tab>
+</Tabs>
+
+## Current producers
+
+| Source | Type | Trigger |
+| --- | --- | --- |
+| `notify_chore_assignees` (DB trigger) | `chores` | `chores` insert, or `assigned_to` changes - including every rotation |
+| `chore-daily-job` | `chores` | Overdue and due-tomorrow sweeps |
+| `notify_flat_new_poll` (DB trigger) | `polls` | Poll created; excludes the creator |
+| `notify_payee_settlement_submitted` (DB trigger) | `expenses` | Settlement inserted; notifies the payee |
+| `reminder-notifications` | `reminders` | `next_notify_at` is due |
+| `test-push` | `test` | Manual diagnostics |
+
+## Delivery path
+
+```text
+notifications row (sent = false)
+        │
+        ▼
+process-notifications
+        │  active flat member?      no ─▶ mark sent, skip
+        │  push_enabled?            no ─▶ mark sent, skip
+        │  category enabled?        no ─▶ mark sent, skip
+        ▼
+send-push-notification
+        │  for each push_subscriptions row for the user
+        ▼
+Web Push (VAPID-signed) ─▶ browser push service ─▶ service worker `push` event
+        │
+        └─▶ sw-push-handler.js renders the notification and wires the click target
+```
+
+## Client side
+
+| File | Responsibility |
+| --- | --- |
+| `src/lib/pushNotifications.ts` | Permission prompt, service worker subscription, writing `push_subscriptions` |
+| `src/hooks/useNotifications.ts` | Inbox query, unread count, mark-as-read, `usePushSubscriptionSync` |
+| `src/config/notifications.ts` | Category metadata for the settings UI |
+| `src/stores/useNotificationStore.ts` | Bell panel open state |
+| `src/components/layout/NotificationBell.tsx` | Inbox UI |
+| `public/sw-push-handler.js` | `push` and `notificationclick` handlers |
+| `src/lib/notificationDebug.ts` | Exposes `window.__debugNotifications()` in the browser console |
+
+`usePushSubscriptionSync` runs at app startup for the signed-in user and reconciles the browser's current subscription with `push_subscriptions`. This matters because browsers rotate endpoints; without the sync, a device silently stops receiving push after a while.
+
+## Adding notifications to a new feature
+
+<Steps>
+  <Step title="Pick or add a category">
+    Reuse an existing `type` if it fits. A new category means a new boolean column on `notification_settings`, a matching branch in `process-notifications`, and an entry in `src/config/notifications.ts`.
+  </Step>
+  <Step title="Queue from the right place">
+    A DB trigger if the event is a row change; an Edge Function if it is scheduled or needs external state.
+  </Step>
+  <Step title="Invoke the processor if timing matters">
+    Triggers only queue. Without an invoke, the row waits for the next scheduled run of another job.
+  </Step>
+  <Step title="Verify end to end">
+    Queue a row manually, run `process-notifications`, and confirm `sent` flips and the device receives it. Then repeat with the category disabled and confirm it is skipped.
+  </Step>
+</Steps>
+
+## Common failures
+
+<AccordionGroup>
+  <Accordion title="Row queued, never sent">
+    Nothing invoked `process-notifications`. Triggers do not self-dispatch.
+  </Accordion>
+  <Accordion title="Marked sent, nothing arrived">
+    Almost always a settings skip. Check `notification_settings.push_enabled` and the category column for that user before suspecting VAPID.
+  </Accordion>
+  <Accordion title="Works on desktop, not on iOS">
+    iOS only delivers push to a PWA installed to the home screen, and only over HTTPS. Use `npm run dev:tunnel` for local testing.
+  </Accordion>
+  <Accordion title="Worked yesterday, silent today">
+    Expired subscription endpoint. Confirm `usePushSubscriptionSync` is running and that `push_subscriptions.last_used_at` is recent.
+  </Accordion>
+  <Accordion title="Nothing anywhere, all environments fine yesterday">
+    Mismatched VAPID pair after an environment change. The public key in the client bundle must match the private key in that project's Edge Function secrets.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,223 @@
+---
+title: "Database functions"
+description: "Reference for every Postgres RPC the FlatApp client calls."
+noindex: true
+---
+
+These are the `SECURITY DEFINER` functions the client invokes with `supabase.rpc(...)`. All of them pin `SET search_path = public`. Signatures are as defined in `supabase/migrations/`.
+
+## Finance
+
+### `create_settlement_bulk`
+
+```sql
+create_settlement_bulk(
+  p_flat_id     UUID,
+  p_payer_id    UUID,
+  p_payee_id    UUID,
+  p_amount      NUMERIC,
+  p_expense_ids UUID[],
+  p_note        TEXT DEFAULT NULL,
+  p_payer_name  TEXT DEFAULT NULL,
+  p_payee_name  TEXT DEFAULT NULL
+)
+```
+
+Inserts one `settlements` row and updates the payer's entry in each listed expense's `settlement_status` to `pending` in a single transaction. The name arguments are denormalised snapshots so the settlement history stays readable after someone leaves the flat.
+
+### `confirm_settlement_batch`
+
+```sql
+confirm_settlement_batch(p_expense_ids UUID[], p_user_id UUID) RETURNS BOOLEAN
+```
+
+Called by the **payee**. Flips their counterparty entries from `pending` to `settled`, then sets `expenses.settled = true` for any expense where every `settlement_status` entry now reads `settled`. Permissions on this function were corrected in `20260607000005_fix_confirm_settlement_permission.sql`.
+
+## Chores
+
+### `rotate_chore`
+
+```sql
+rotate_chore(chore_uuid UUID)
+```
+
+The heart of rotation. Requires `recurrence != 'none'` and a non-empty `rotation_members`. It writes a `chore_completions` row for the period that is closing (`completed` if the chore was done, `missed` otherwise), advances `current_assignee_index`, sets `assigned_to = [next_assignee]` and `last_rotated_at = now()`, then clears `completed`, `completed_by`, and `completed_at`.
+
+Updating `assigned_to` fires the `notify_chore_assignees` trigger, which queues a "Chore assigned" notification.
+
+### `apply_default_rotation_to_chores`
+
+```sql
+apply_default_rotation_to_chores(p_flat_id uuid, p_default_order uuid[])
+```
+
+Admin action from flat settings. Overwrites `rotation_members` on every rotating chore in the flat with the flat's default member order.
+
+## Lists
+
+### `ensure_default_shopping_list` / `ensure_default_todo_list`
+
+```sql
+ensure_default_shopping_list(p_flat_id UUID)
+ensure_default_todo_list(p_flat_id UUID)
+```
+
+Idempotent. Creates the flat's `is_default` list if it does not exist and returns it. Called on first visit to each page so a new flat never sees an empty state caused by a missing list row.
+
+### `record_shopping_purchase` / `record_todo_completion`
+
+```sql
+record_shopping_purchase(p_flat_id UUID, p_item_name TEXT, p_pinned_by UUID, p_list_id UUID)
+record_todo_completion(p_flat_id UUID, p_item_name TEXT, p_completed_by UUID, p_list_id UUID)
+```
+
+Append to the history table and increment `purchase_count` on the matching favourite, creating the favourite row if this is the first time the item has been seen. This is what powers "you buy milk most weeks" suggestions.
+
+## Flats and invites
+
+### `join_by_invite`
+
+```sql
+join_by_invite(p_token_hash TEXT, p_short_code TEXT) RETURNS JSONB
+```
+
+Accepts **either** a SHA-256 token hash (from a link) or a typed short code. Validates `revoked`, `expires_at`, and `use_count < max_uses`; records an attempt for rate limiting; inserts or reactivates the `flat_members` row; sets `users_profile.active_flat_id`. Returns `{ flat, already_member? }` or `{ error }`.
+
+The client hashes the raw token locally (`hashToken` in `src/lib/inviteTokens.ts`) and never transmits it.
+
+### `get_invite_preview`
+
+Returns just enough to render the join screen (flat name, member count) before the visitor commits. Anonymous access to it is deliberately restricted - see `20260506000003_revoke_anon_invite_preview.sql`.
+
+### `cleanup_flat_leave`
+
+```sql
+cleanup_flat_leave(p_user_id UUID, p_flat_id UUID)
+```
+
+Sets the membership to `status = 'left'` rather than deleting it, removes the user from `rotation_members` and `assigned_to` on that flat's chores, and clears `active_flat_id` if it pointed here. Historical rows keep referencing the user so completion history and expense attribution survive.
+
+### `delete_user_account`
+
+```sql
+delete_user_account(p_user_id UUID)
+```
+
+Full account removal, paired with the `delete-account` Edge Function. Fixed in `20260608000002_fix_delete_user_account_fn.sql`.
+
+## Gamification
+
+### `open_reward_case`
+
+```sql
+open_reward_case(p_user_id UUID) RETURNS JSONB
+```
+
+Raises if `cases_available <= 0`. Decrements the counter, rolls rarity against a weighted table, picks a random `cosmetic_items` row of that rarity, and either grants it or reports a duplicate.
+
+| Rarity | Weight | Probability |
+| --- | --- | --- |
+| Common | 50 | 45.5% |
+| Uncommon | 30 | 27.3% |
+| Rare | 15 | 13.6% |
+| Epic | 10 | 9.1% |
+| Legendary | 5 | 4.5% |
+
+The weights total 110, not 100. That is intentional in the implementation (`random() * 110`) but it means the percentages are not the round numbers the weights suggest. Duplicates award no coins automatically - see `20260310000008_no_auto_coins_on_duplicate.sql`. The player scraps the duplicate instead.
+
+### `buy_case`
+
+```sql
+buy_case(p_user_id UUID, p_quantity INT DEFAULT 1) RETURNS JSONB
+```
+
+100 coins per case (mirrored as `CASE_PRICE` in `src/hooks/useCases.ts`). Returns `{ coins_spent, cases_bought, coins_remaining, cases_available }`.
+
+<Warning>
+  The price exists in two places. If you change it in SQL, change `CASE_PRICE` too, or the optimistic coin deduction in the UI will disagree with the server.
+</Warning>
+
+### `scrap_item`
+
+```sql
+scrap_item(p_user_id UUID, p_inventory_id UUID) RETURNS JSONB
+```
+
+Destroys an owned cosmetic for coins by rarity: common 25, uncommon 50, rare 100, epic 200, legendary 500. Mirrored as `SCRAP_VALUES` in `src/lib/bountyConstants.ts`.
+
+### `equip_cosmetic`
+
+```sql
+equip_cosmetic(p_user_id UUID, p_slot TEXT, p_item_id TEXT DEFAULT NULL)
+```
+
+Slots are `title`, `avatar_color`, `avatar_frame`, `profile_effect`, `avatar_emoji`. Passing `NULL` for `p_item_id` unequips the slot. Verifies ownership in `user_inventory` before writing `users_profile.equipped_*`.
+
+### `claim_bounty`
+
+```sql
+claim_bounty(p_bounty_id UUID, p_user_id UUID, p_completed_date TEXT) RETURNS JSONB
+```
+
+One claim per bounty per user per day. Rewards are deliberately small so bounties supplement chores rather than replace them: easy 1 XP / 5 coins, medium 2 XP / 10 coins, hard 3 XP / 15 coins.
+
+### `claim_daily_login_bonus`
+
+```sql
+claim_daily_login_bonus(p_user_id UUID, p_flat_id UUID, p_date TEXT) RETURNS JSONB
+```
+
+Returns `{ already_claimed: true }` if there is a row in `daily_login_claims` for that date, and raises if the caller is not an active member. Otherwise rolls a prize wheel:
+
+| Segment | Roll | Coins | Cases |
+| --- | --- | --- | --- |
+| A | 0-40 | 5 | 0 |
+| B | 40-65 | 10 | 0 |
+| C | 65-80 | 25 | 0 |
+| D | 80-90 | 50 | 0 |
+| E | 90-95 | 100 | 0 |
+| F | 95-97 | 200 | 0 |
+| G | 97-99.5 | 25 | 1 |
+| H | 99.5-100 | 50 | 10 |
+
+### `increment_user_xp`, `evaluate_streak`, `check_and_award_badges`
+
+```sql
+increment_user_xp(p_user_id UUID, p_amount INT)
+evaluate_streak(p_user_id UUID, p_flat_id UUID) RETURNS JSONB
+check_and_award_badges(p_user_id UUID, p_flat_id UUID, p_total_xp INT, p_streak_weeks INT, p_total_completions INT) RETURNS JSONB
+```
+
+`evaluate_streak` rejects callers where `p_user_id != auth.uid()`, locks the `user_streaks` row `FOR UPDATE`, and short-circuits if it already ran this ISO week. It breaks the streak on incomplete recurring chores assigned to the user, and tolerates weeks with no assigned chores rather than treating them as failures.
+
+`check_and_award_badges` is idempotent and awards any badge whose threshold is now met.
+
+## Notifications
+
+### `queue_notification`
+
+```sql
+queue_notification(
+  p_user_id UUID,
+  p_type    TEXT,
+  p_title   TEXT,
+  p_body    TEXT  DEFAULT NULL,
+  p_data    JSONB DEFAULT '{}',
+  p_flat_id UUID  DEFAULT NULL,
+  p_scheduled_at TIMESTAMPTZ DEFAULT NULL
+) RETURNS UUID
+```
+
+Granted to both `service_role` and `authenticated`. Inserts into `notifications` with `sent = false`. `p_scheduled_at` defers delivery: `process-notifications` only picks up rows where it is null or already past. This is the **only** sanctioned entry point for user-facing notifications. See [Notification pipeline](/internal/notifications-pipeline).
+
+## Triggers
+
+| Trigger function | Fires on | Queues |
+| --- | --- | --- |
+| `handle_new_user` | `auth.users` insert | Creates `users_profile` |
+| `notify_chore_assignees` | `chores` insert or `assigned_to` update | "Chore assigned" per assignee |
+| `notify_flat_new_poll` | `polls` insert | "New poll" to every member except the creator |
+| `notify_payee_settlement_submitted` | `settlements` insert | "Payment submitted" to the payee |
+| `trg_chore_coins_fn` | Chore completion | Awards coins by difficulty |
+| `trg_sync_xp_fn` | `users_profile.total_xp` update | Recomputes `level` and `highest_level_reached` |
+| `recalc_late_completion_xp` | `chore_completions` update to `completed_late` | Applies the late XP multiplier |

@@ -1,0 +1,116 @@
+---
+title: "Security and RLS"
+description: "How FlatApp enforces authorisation with Row Level Security and SECURITY DEFINER functions."
+noindex: true
+---
+
+There is no application server. Postgres is the only enforcement point, so **an RLS policy is production security code**. Review changes to `supabase/migrations/` policies with the same care as an auth change.
+
+## The tenancy rule
+
+Every policy reduces to one question: *is the caller an active member of this row's flat?*
+
+```sql
+CREATE OR REPLACE FUNCTION public.get_user_flat_ids()
+RETURNS SETOF uuid
+LANGUAGE sql SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT flat_id FROM flat_members WHERE user_id = auth.uid();
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_flat_admin(check_flat_id uuid)
+RETURNS boolean
+LANGUAGE sql SECURITY DEFINER SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM flat_members
+    WHERE flat_id = check_flat_id
+      AND user_id = auth.uid()
+      AND role = 'admin'
+      AND status = 'active'
+  );
+$$;
+```
+
+Feature tables then use the helper rather than an inline subquery:
+
+```sql
+CREATE POLICY "Members read expenses in their flat" ON public.expenses
+  FOR SELECT USING (flat_id IN (SELECT get_user_flat_ids()));
+```
+
+<Warning>
+  These helpers exist because inlining `SELECT flat_id FROM flat_members ...` inside a policy **on `flat_members` itself** causes infinite recursion. That bug shipped once and was fixed in `20260306021054_fix_flat_members_rls_recursion.sql`. Always go through `get_user_flat_ids()` or `is_flat_admin()`; never write a policy that reads the table it protects.
+</Warning>
+
+## When to use SECURITY DEFINER instead
+
+Use an RPC when a write must be atomic across rows, must apply business rules the client cannot be trusted with, or must read something the caller cannot otherwise see.
+
+| Situation | Example |
+| --- | --- |
+| Multi-row atomic write | `create_settlement_bulk`, `confirm_settlement_batch` |
+| Server-decided randomness | `open_reward_case`, `claim_daily_login_bonus` |
+| Anti-cheat on rewards | `claim_bounty`, `buy_case`, `scrap_item` |
+| Access before membership exists | `get_invite_preview`, `join_by_invite` |
+| Cross-member cleanup | `cleanup_flat_leave`, `delete_user_account` |
+
+Every one of these sets `SET search_path = public`. Do not omit it - a `SECURITY DEFINER` function without a pinned search path is a privilege escalation vector.
+
+Several also re-check the caller explicitly, because `SECURITY DEFINER` bypasses RLS:
+
+```sql
+IF p_user_id != auth.uid() THEN
+  RETURN jsonb_build_object('evaluated', false, 'error', 'unauthorized');
+END IF;
+```
+
+<Note>
+  When you write a new `SECURITY DEFINER` function that takes a `p_user_id`, assume an attacker will pass someone else's id. Compare against `auth.uid()` or verify active membership in `flat_members` before doing anything.
+</Note>
+
+## Secrets
+
+| Secret | Where it lives | Never |
+| --- | --- | --- |
+| `VITE_SUPABASE_ANON_KEY` | Client bundle | Treated as a secret. It is public by design; RLS is what protects data |
+| `SUPABASE_SERVICE_ROLE_KEY` | Edge Function secrets only | In `.env.local`, the bundle, or a repo |
+| `VAPID_PRIVATE_KEY` | Edge Function secrets only | In the client |
+| `VITE_VAPID_PUBLIC_KEY` | Client env, per environment | Mixed across environments - the pair must match |
+| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` | Edge Function secrets only | Anywhere client-side |
+
+Each environment gets its **own** VAPID pair. A staging public key with a production private key produces subscriptions that silently never deliver.
+
+## Invite security
+
+Invite links are not guessable codes stored in plaintext.
+
+1. The client generates a 128-bit random token (`generateRawToken`) and a display short code from an alphabet that omits `0`, `O`, `1`, and `I`.
+2. Only the SHA-256 hash of the token is stored in `invite_tokens`.
+3. Redemption goes through `join_by_invite`, which checks `revoked`, `expires_at`, and `max_uses` against `use_count`.
+4. `invite_join_attempts` plus `cleanup_invite_join_attempts` rate limit redemption so a token cannot be brute-forced.
+5. `get_invite_preview` lets a signed-out visitor see the flat name before joining. Anon access to it was deliberately revoked and re-scoped in `20260506000003_revoke_anon_invite_preview.sql` - check that migration before loosening it again.
+
+## Account deletion
+
+`delete-account` (Edge Function) plus `delete_user_account` (RPC) remove the auth user and cascade the profile. `cleanup_flat_leave` handles the softer case of leaving a flat: membership goes to `status = 'left'` rather than being deleted, so historical `chore_completions` and `expenses` keep a valid `assigned_to` and `paid_by`.
+
+## Review checklist for schema changes
+
+<Steps>
+  <Step title="Is RLS enabled on the new table?">
+    `ALTER TABLE public.x ENABLE ROW LEVEL SECURITY;` - a new table with no policies and RLS off is world-readable to any authenticated user.
+  </Step>
+  <Step title="Does it carry flat_id?">
+    If a row belongs to a flat, denormalise `flat_id` onto it so the policy needs no join.
+  </Step>
+  <Step title="Are there policies for every verb you need?">
+    `FOR ALL` is convenient but blunt. Separate `SELECT` from `INSERT`/`UPDATE`/`DELETE` when the rules differ, as they do for `chore_completions`.
+  </Step>
+  <Step title="Does any new function pin search_path?">
+    Every `SECURITY DEFINER` function needs `SET search_path = public`.
+  </Step>
+  <Step title="Did you test as a non-member?">
+    Sign in as a user in a different flat and confirm the query returns zero rows rather than an error. Silent emptiness is correct; a permission error usually means the policy is wrong.
+  </Step>
+</Steps>

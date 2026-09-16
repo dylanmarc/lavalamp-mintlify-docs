@@ -1,0 +1,98 @@
+---
+title: "Shopping and todos"
+description: "Multi-list structure, ordering, history, and the recommendation loop shared by both features."
+noindex: true
+---
+
+**Routes:** `/shopping`, `/todos` · **Hooks:** `src/hooks/useShopping.ts`, `src/hooks/useTodos.ts`
+
+These two features are near-identical by design. Fix a bug in one and check the other.
+
+## Shared structure
+
+```text
+flat
+ └── *_lists            named lists, one flagged is_default
+      └── items         ordered by `position`
+ ├── *_favorites        pinned and auto-suggested item names, with purchase_count
+ └── *_history          every purchase / completion, denormalised by item name
+```
+
+| Concern | Shopping | Todos |
+| --- | --- | --- |
+| Lists | `shopping_lists` | `todo_lists` |
+| Items | `shopping_list` *(singular)* | `todos` |
+| Favourites | `shopping_favorites` | `todo_favorites` |
+| History | `shopping_purchase_history` | `todo_completion_history` |
+| Done flag | `bought`, `bought_by` | `completed`, `completed_by` |
+| Extra field | `quantity` | `priority` (`low` / `medium` / `high`) |
+| Ensure default | `ensure_default_shopping_list` | `ensure_default_todo_list` |
+| Record done | `record_shopping_purchase` | `record_todo_completion` |
+
+<Note>
+  The item table for shopping is singular (`shopping_list`) while its list table is plural (`shopping_lists`). Historical naming, kept to avoid a migration that renames a table half the app queries.
+</Note>
+
+## Default lists
+
+Both pages call their `ensure_default_*` RPC on load. The function is idempotent: it returns the existing `is_default` list or creates one. This is why a brand-new flat does not need a setup step before adding an item, and why the empty state you see is "no items" rather than "no list".
+
+## Ordering
+
+`position` is an integer maintained client-side by dnd-kit. `useReorderShoppingItem` / `useReorderTodoItem` recompute positions for the affected range and write them optimistically.
+
+Reordering is the most latency-sensitive interaction in the app - a drag that snaps back while waiting for a round trip feels broken. The optimistic path is doing real work here, not just polish.
+
+## The recommendation loop
+
+This is the only genuinely clever thing in these features.
+
+<Steps>
+  <Step title="Item is marked done">
+    `useToggleShoppingItem` sets `bought = true` and records `bought_by`.
+  </Step>
+  <Step title="History and counter">
+    `record_shopping_purchase(p_flat_id, p_item_name, p_pinned_by, p_list_id)` appends to `shopping_purchase_history` and increments `purchase_count` on the matching `shopping_favorites` row, creating it if this is the first sighting.
+  </Step>
+  <Step title="Suggestion">
+    Items with a high `purchase_count` and `is_removed = false` surface as suggestions next time someone adds to the list.
+  </Step>
+  <Step title="Dismissal">
+    Dismissing a suggestion sets `is_removed = true`. Manually pinning sets `is_manual = true`, which keeps it regardless of count.
+  </Step>
+</Steps>
+
+Favourites are keyed by **item name**, not by item id, which is what lets "milk" accumulate a count across hundreds of separate rows. It also means "Milk" and "milk" are different favourites - normalise on the way in if that starts producing duplicate suggestions.
+
+`list_id` on a favourite scopes it to one list; `null` makes it flat-wide.
+
+## Clearing
+
+| Hook | Scope |
+| --- | --- |
+| `useClearBoughtItems` | Bought items in one list |
+| `useClearAllBoughtItems` | Bought items across the whole flat |
+| `useClearCompletedItems` | Completed todos in one list |
+
+These delete rows. History and favourite counts are unaffected, because those live in separate tables - which is the point of recording them separately in the first place.
+
+## Cross-list views
+
+`useAllShoppingItems(flatId)` and `useAllTodoItems(flatId)` aggregate across every list in the flat, for the combined view and the dashboard. They use their own query keys (`todoAll`, and the shopping equivalent), so invalidating a single list's key does **not** refresh them. Mutations must invalidate both.
+
+<Warning>
+  This is the most common bug in these two features: an item is added, the list updates, and the combined view still shows the old count. Check that the mutation invalidates the per-list key *and* the aggregate key.
+</Warning>
+
+## Migration history worth knowing
+
+| Migration | Change |
+| --- | --- |
+| `20260318000001_shopping_position_and_list_favorites` | Added `position` and list-scoped favourites |
+| `20260318000002_shopping_purchase_count` | Added `purchase_count` |
+| `20260318000003_shopping_history` | Added the history table |
+| `20260320000001_shopping_recommendations` | The suggestion query |
+| `20260321000001_todo_lists` | Multi-list todos |
+| `20260321000002_todo_history_priority` | Todo history and `priority` |
+
+Todos gained multi-list support after shopping did, which is why a few todo helpers still read as if there were only one list.

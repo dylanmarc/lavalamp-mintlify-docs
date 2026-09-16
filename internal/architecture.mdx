@@ -1,0 +1,109 @@
+---
+title: "Architecture"
+description: "How the FlatApp client, Supabase backend, and scheduled jobs fit together."
+noindex: true
+---
+
+## Components
+
+FlatApp has four moving parts and no bespoke application server.
+
+<Steps>
+  <Step title="React SPA (Vercel)">
+    Vite-built static bundle with a Workbox service worker. Holds all UI, routing, validation, and cache. Authenticates against Supabase Auth and reads and writes Postgres directly through the Supabase JS client.
+  </Step>
+  <Step title="Postgres (Supabase)">
+    Every table, every Row Level Security policy, and a large set of `SECURITY DEFINER` functions that perform the writes the client is not trusted to perform directly (settlements, rotation, case opening, joining a flat).
+  </Step>
+  <Step title="Edge Functions (Supabase, Deno)">
+    Ten functions covering push delivery, scheduled chore rotation, reminder sweeps, invite redemption, account deletion, and Stripe. These hold the service-role key and the VAPID private key.
+  </Step>
+  <Step title="Schedulers">
+    External cron (or pg_cron) that hits `chore-daily-job` once a day and `reminder-notifications` every fifteen minutes.
+  </Step>
+</Steps>
+
+## Request paths
+
+There are exactly three ways data changes, and knowing which one a feature uses tells you where to debug it.
+
+<Tabs>
+  <Tab title="Direct table write">
+    The common case. A hook calls `supabase.from('todos').insert(...)`. RLS decides whether it is allowed. Used for todos, shopping items, polls, reminders, chores, and expense inserts.
+
+    Debug by: checking the RLS policy for that table and the caller's `flat_id`.
+  </Tab>
+  <Tab title="RPC (SECURITY DEFINER)">
+    Used when a write must touch several rows atomically or must bypass RLS deliberately. `create_settlement_bulk`, `rotate_chore`, `open_reward_case`, `claim_bounty`, `join_by_invite`.
+
+    Debug by: calling the function directly in the SQL editor with the same arguments.
+  </Tab>
+  <Tab title="Edge Function">
+    Used when secrets are needed or the work is scheduled. `process-notifications`, `send-push-notification`, `chore-daily-job`, `reminder-notifications`, `create-checkout-session`, `stripe-webhook`, `delete-account`, `join-by-invite`.
+
+    Debug by: reading the function logs in the Supabase dashboard.
+  </Tab>
+</Tabs>
+
+## Data flow for a typical write
+
+```text
+User action
+  │
+  ├─▶ onMutate: cancelAndSnapshot() → optimisticUpdateList() → UI updates immediately
+  │
+  ├─▶ supabase.from(...).insert() / .rpc(...)      (RLS or SECURITY DEFINER applies)
+  │
+  ├─▶ onError: rollback(queryClient, key, previous)
+  │
+  ├─▶ onSettled: invalidateQueries(key) → authoritative data replaces the temp row
+  │
+  └─▶ Postgres Realtime broadcasts the change
+         │
+         └─▶ other members' clients invalidate the same key and refetch
+```
+
+The optimistic layer is not optional decoration. Members are usually on phones on patchy connections, and the perceived latency of a shopping list that waits for a round trip is the difference between the list getting used and not.
+
+## Notification flow
+
+Push is the one place with a strict architectural rule: **queue, then process**.
+
+```text
+DB trigger  ─┐
+Edge Function ┼─▶ queue_notification() ─▶ notifications (sent = false)
+RPC          ─┘                                   │
+                                                  ▼
+                                    process-notifications (Edge Function)
+                                                  │
+                             reads notification_settings + push_subscriptions
+                                                  │
+                                                  ▼
+                                      send-push-notification (Web Push + VAPID)
+                                                  │
+                                                  ▼
+                                       service worker → device
+```
+
+Nothing in the client queues notifications, because the client cannot be trusted to decide who is allowed to receive one. See [Notification pipeline](/internal/notifications-pipeline) for the full contract.
+
+## Time and timezones
+
+Every flat has a `timezone` (default `Australia/Melbourne`). The daily job runs once globally at a fixed UTC hour, then evaluates "is today the rotation day" **per flat in that flat's timezone** using Luxon. This is why a single daily run is sufficient for flats anywhere in the world, and why changing the cron hour changes which local time members see rotation happen.
+
+## Deliberate constraints
+
+<AccordionGroup>
+  <Accordion title="No application server">
+    All authorisation lives in Postgres. This keeps one enforcement point but means an RLS mistake is a data leak, not a bug. Treat policy changes as security changes and review them as such.
+  </Accordion>
+  <Accordion title="Multi-flat, single active flat">
+    `flat_members` is the join table and supports many flats per user, but the UI works against `users_profile.active_flat_id` at any moment. Queries always filter by that one flat id.
+  </Accordion>
+  <Accordion title="Push is best-effort">
+    A dead or expired `push_subscriptions` row fails silently per device. The in-app notification row in `notifications` is the durable record; the push is the nudge.
+  </Accordion>
+  <Accordion title="Realtime is an invalidation signal, not a data channel">
+    Realtime payloads are ignored. The client only uses the event to invalidate a TanStack Query key and refetch through the normal RLS-checked path, so a Realtime message can never deliver data the user is not entitled to.
+  </Accordion>
+</AccordionGroup>

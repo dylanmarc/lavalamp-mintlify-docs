@@ -1,0 +1,108 @@
+---
+title: "Migrations"
+description: "Writing, testing, and applying database migrations."
+noindex: true
+---
+
+Migrations live in `supabase/migrations/` and apply in filename order. They are **append-only**: once a migration has run anywhere other than your own machine, it is history.
+
+## Creating one
+
+```bash
+npx supabase migration new add_description_to_polls
+# → supabase/migrations/<timestamp>_add_description_to_polls.sql
+```
+
+Write the SQL, then test from scratch:
+
+```bash
+npx supabase db reset
+npm run use:local && npm run dev
+```
+
+`db reset` replays every migration against an empty database. A migration that only works as a delta against your current local state will fail here, which is exactly what you want to discover now.
+
+## What belongs in one
+
+<AccordionGroup>
+  <Accordion title="Schema changes">
+    Tables, columns, indexes, constraints.
+  </Accordion>
+  <Accordion title="RLS">
+    Enabling RLS and every policy. A new table without `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` is readable by every authenticated user.
+  </Accordion>
+  <Accordion title="Functions and triggers">
+    Always `CREATE OR REPLACE`, so the migration is re-runnable.
+  </Accordion>
+  <Accordion title="Realtime publication">
+    `ALTER PUBLICATION supabase_realtime ADD TABLE public.x;` if the table needs live updates.
+  </Accordion>
+  <Accordion title="Grants">
+    `GRANT EXECUTE ON FUNCTION ... TO authenticated;` for anything the client calls.
+  </Accordion>
+  <Accordion title="Seed data">
+    Catalogue rows like `badges` and `cosmetic_items`, always with `ON CONFLICT DO NOTHING`.
+  </Accordion>
+</AccordionGroup>
+
+## House patterns
+
+Make everything idempotent. These migrations get re-run against branches and fresh projects constantly.
+
+```sql
+CREATE TABLE IF NOT EXISTS public.thing (...);
+ALTER TABLE public.thing ADD COLUMN IF NOT EXISTS note TEXT;
+CREATE INDEX IF NOT EXISTS idx_thing_flat_id ON public.thing(flat_id);
+DROP POLICY IF EXISTS "Members read thing" ON public.thing;
+CREATE POLICY "Members read thing" ON public.thing
+  FOR SELECT USING (flat_id IN (SELECT get_user_flat_ids()));
+INSERT INTO public.badges (...) VALUES (...) ON CONFLICT (id) DO NOTHING;
+```
+
+Every `SECURITY DEFINER` function pins its search path:
+
+```sql
+CREATE OR REPLACE FUNCTION public.do_thing(p_flat_id UUID)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$ ... $$;
+```
+
+## Applying
+
+```bash
+npx supabase projects list      # confirm which project is linked
+npx supabase db push --linked
+```
+
+Staging first, production second, and both before the frontend that depends on them.
+
+## Naming
+
+`<timestamp>_<snake_case_description>.sql`. The timestamp decides ordering, so two branches that each generate a migration on the same day can interleave in an order neither author tested. Rebase and, if needed, rename so the ordering is what you intend.
+
+## What not to do
+
+<Warning>
+  - **Never edit an applied migration.** Write a new one.
+  - **Never apply `db_schema.sql`.** It is a dump for reading.
+  - **Never drop a column in the same release that stops writing it.** Two releases: stop reading, then drop.
+  - **Never skip the local `db reset`.** It is the only thing that proves the migration composes with everything before it.
+</Warning>
+
+## Reading the history
+
+The migration log is genuinely useful archaeology. A few worth knowing:
+
+| Migration | Why it matters |
+| --- | --- |
+| `20250100000000_base_schema` | The starting point |
+| `20260303000002_multi_flat_schema` | Introduced `flat_members`; the single-flat model ends here |
+| `20260306021054_fix_flat_members_rls_recursion` | Added `get_user_flat_ids()` / `is_flat_admin()` and the reason they exist |
+| `20260310000001_xp_system` onward | The whole gamification layer, rebalanced several times |
+| `20260505000001_invite_tokens` | Hashed invite links replacing raw codes |
+| `20260522000002_invite_join_rate_limiting` | Brute-force protection on redemption |
+
+If a policy or function looks strange, `git log` on its migration usually explains it.

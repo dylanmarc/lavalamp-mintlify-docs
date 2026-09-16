@@ -1,0 +1,61 @@
+---
+title: "Repository structure"
+description: "Where things live in flatapp-v2."
+noindex: true
+---
+
+```text
+flatapp-v2/
+├── src/
+│   ├── components/
+│   │   ├── auth/         ProtectedRoute
+│   │   ├── cases/        Case opening animation and reveal
+│   │   ├── chores/       ChoreCard, ChoreForm, ChoreHistoryModal
+│   │   ├── common/       ConfirmDialog, EmptyState, ErrorBoundary, LoadingState, Toaster
+│   │   ├── dashboard/    ExpenseSummaryCard, ChoreTimeline, UpcomingReminders
+│   │   ├── expenses/     BalancesView, ExpenseCard, ExpenseForm, ItemizedGrid, SettlementModal
+│   │   ├── inventory/    Cosmetic grid and equip controls
+│   │   ├── layout/       Layout, NotificationBell
+│   │   ├── profile/      Profile header, stats, badge display
+│   │   ├── shopping/     List and item components
+│   │   ├── todos/        List and item components
+│   │   ├── ui/           Button, Card, Input, Modal, Select, Tabs, Switch, FAB, ...
+│   │   └── xp/           XP bar, level chip
+│   ├── config/           notifications.ts, timezones.ts
+│   ├── hooks/            One hook module per feature (useChores, useExpenses, ...)
+│   ├── lib/              supabase client, query keys, optimistic helpers, push, utils
+│   ├── pages/            One component per route
+│   ├── stores/           Zustand stores
+│   ├── types/            index.ts - every shared interface
+│   └── App.tsx           Route table and auth gate
+├── supabase/
+│   ├── migrations/       Canonical schema history, applied in filename order
+│   ├── functions/        Ten Edge Functions
+│   ├── config.toml       Local stack ports and auth settings
+│   └── seed.sql
+├── public/               Icons, offline.html, sw.js, sw-push-handler.js, welcome/
+├── scripts/              Screenshot tooling
+├── docs/                 Legacy in-repo markdown (superseded by this site)
+├── db_schema.sql         Full dump of the current production schema
+└── supabase-schema.sql   Bootstrap schema for a brand-new project
+```
+
+## Rules of thumb
+
+<AccordionGroup>
+  <Accordion title="One hook module per feature">
+    `src/hooks/useChores.ts` owns every query and mutation that touches chores. Pages do not call `supabase` directly. If a page imports `supabase`, that is a smell worth fixing.
+  </Accordion>
+  <Accordion title="Query keys are centralised">
+    Never inline a query key. `src/lib/queryKeys.ts` is the only place they are constructed, so invalidation always matches.
+  </Accordion>
+  <Accordion title="Types mirror the database">
+    `src/types/index.ts` is hand-maintained against the schema. When you add a column, update the interface in the same commit as the migration.
+  </Accordion>
+  <Accordion title="Migrations are append-only">
+    Never edit a migration that has been applied to staging or production. Write a new one. `db_schema.sql` is a dump for reference, not something to apply.
+  </Accordion>
+  <Accordion title="The legacy docs/ folder">
+    `docs/` in the app repo predates this site. It is still accurate in places and stale in others (for example `TECHNICAL_DOCUMENTATION.md` still describes a single-flat model). Prefer this site; migrate anything useful you find and delete the original.
+  </Accordion>
+</AccordionGroup>

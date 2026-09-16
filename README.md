@@ -1,55 +1,68 @@
-# Mintlify Starter Kit
+# FlatApp documentation
 
-Use the starter kit to get your docs deployed and ready to customize.
+Mintlify documentation site for [FlatApp](https://github.com/dylanmarc/flatapp-v2), a PWA for shared households.
 
-Click the green **Use this template** button at the top of this repo to copy the Mintlify starter kit. The starter kit contains examples with
+## Two sections
 
-- Guide pages
-- Navigation
-- Customizations
-- API reference pages
-- Use of popular components
+| Tab | Path | Audience |
+| --- | --- | --- |
+| **Internal** | `index.mdx`, `internal/` | Engineering. Architecture, schema, RPCs, Edge Functions, environments, runbooks. |
+| **User guide** | `user-guide/` | Customers. Written to be published as-is when the site goes public. |
 
-**[Follow the full quickstart guide](https://starter.mintlify.com/quickstart)**
+## Privacy
 
-## AI-assisted writing
+**This site is private.** Two mechanisms, both should stay on until you decide otherwise:
 
-Set up your AI coding tool to work with Mintlify:
+1. `noindex: true` in every page's frontmatter, so crawlers do not index them.
+2. Access control on the Mintlify deployment, which is what actually prevents access.
+
+`noindex` is a request to crawlers, not a lock. Configure access control in the Mintlify dashboard.
+
+See `internal/contributing/documentation.mdx` for the checklist to follow when publishing the user guide.
+
+## Local preview
 
 ```bash
-npx skills add https://mintlify.com/docs
-```
-
-This command installs Mintlify's documentation skill for your configured AI tools like Claude Code, Cursor, Windsurf, and others. The skill includes component reference, writing standards, and workflow guidance.
-
-See the [AI tools guides](/ai-tools) for tool-specific setup.
-
-## Development
-
-Install the [Mintlify CLI](https://www.npmjs.com/package/mint) to preview your documentation changes locally. To install, use the following command:
-
-```
 npm i -g mint
+mint dev          # http://localhost:3000
 ```
 
-Run the following command at the root of your documentation, where your `docs.json` is located:
+Run from the repo root, where `docs.json` lives.
+
+## Structure
 
 ```
-mint dev
+docs.json                  Site config: theme, colours, navigation tabs
+index.mdx                  Internal landing page
+internal/
+  architecture.mdx         System overview
+  tech-stack.mdx
+  repo-structure.mdx
+  data-model.mdx           Every table
+  security-rls.mdx         RLS and SECURITY DEFINER rules
+  database-functions.mdx   RPC reference
+  edge-functions.mdx       The ten Edge Functions
+  notifications-pipeline.mdx
+  scheduled-jobs.mdx
+  frontend-architecture.mdx
+  data-fetching.mdx        Query keys and optimistic mutations
+  realtime.mdx
+  conventions.mdx
+  features/                Per-feature deep dives
+  ops/                     Environments, local dev, deployment, migrations, runbook, observability
+  contributing/            Workflow, adding a feature, maintaining these docs
+user-guide/
+  introduction.mdx ... polls.mdx
+  rewards/
+  account/
+logo/, favicon.svg
 ```
 
-View your local preview at `http://localhost:3000`.
+## Adding a page
+
+1. Create the `.mdx` file with `title`, `description`, and `noindex: true` in the frontmatter.
+2. Add its path to the right group in `docs.json`. A file not listed in the navigation does not appear on the site.
 
 ## Publishing changes
 
-Install our GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app) to propagate changes from your repo to your deployment. Changes are deployed to production automatically after pushing to the default branch.
-
-## Need help?
-
-### Troubleshooting
-
-- If your dev environment isn't running: Run `mint update` to ensure you have the most recent version of the CLI.
-- If a page loads as a 404: Make sure you are running in a folder with a valid `docs.json`.
-
-### Resources
-- [Mintlify documentation](https://mintlify.com/docs)
+Install the Mintlify GitHub app from the [dashboard](https://dashboard.mintlify.com/settings/organization/github-app). Pushes to the default branch deploy automatically.

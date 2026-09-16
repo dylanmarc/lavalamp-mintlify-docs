@@ -1,0 +1,145 @@
+---
+title: "Data model"
+description: "Every table in the FlatApp Postgres schema, grouped by domain."
+noindex: true
+---
+
+All tables live in the `public` schema. Almost every one carries a `flat_id` - that column is what RLS keys off, and it is denormalised onto child tables (for example `chore_completions`) specifically so policies do not need joins.
+
+<Info>
+  The canonical schema is `supabase/migrations/`, applied in filename order. `db_schema.sql` at the repo root is a dump for reading and is not fully current. `supabase-schema.sql` is a bootstrap for a brand-new project only.
+</Info>
+
+## Identity and tenancy
+
+### `users_profile`
+Extends `auth.users`. Created by the `handle_new_user` trigger on signup.
+
+| Column | Notes |
+| --- | --- |
+| `id` | PK, FK to `auth.users.id` |
+| `name`, `avatar_url` | Display identity |
+| `active_flat_id` | The flat the UI is currently pointed at |
+| `role` | `admin` or `member` (legacy; per-flat role lives on `flat_members`) |
+| `total_xp`, `level`, `highest_level_reached` | Gamification totals |
+| `coins`, `cases_available` | Reward currency and unopened cases |
+| `equipped_title`, `equipped_color`, `equipped_frame`, `equipped_effect`, `equipped_emoji` | Currently equipped cosmetics |
+
+### `flats`
+| Column | Notes |
+| --- | --- |
+| `id`, `name`, `created_by`, `created_at` | |
+| `invite_code` | Legacy short code, unique |
+| `timezone` | IANA zone, default `Australia/Melbourne`. Drives all scheduled logic |
+| `default_chore_rotation` | `UUID[]` used as the default member order for new rotating chores |
+| `subscription_tier`, `subscription_expires_at`, `stripe_customer_id` | Billing state |
+| `last_chore_job_processed_date` | Local date the chore job last dispatched notifications for this flat, so re-runs stay idempotent |
+
+### `flat_members`
+The real membership join table. A user may have rows in several flats.
+
+| Column | Notes |
+| --- | --- |
+| `user_id`, `flat_id` | Composite identity |
+| `role` | `admin` or `member`, scoped to this flat |
+| `status` | `active`, `left`, or `invited`. **Only `active` counts** for RLS and for every member list |
+| `joined_at`, `left_at` | |
+
+### `invite_tokens` and `invite_join_attempts`
+`invite_tokens` holds hashed invite links: `short_code`, `expires_at`, `max_uses`, `use_count`, `revoked`. The raw token is never stored - the client hashes it with SHA-256 before lookup. `invite_join_attempts` backs rate limiting on redemption.
+
+## Chores
+
+### `chores`
+Title, description, `assigned_to UUID[]`, `due_date`, `recurrence` (`daily` / `weekly` / `monthly` / `none`), `recurrence_interval`, `day_of_week`, `points`, `difficulty` (`easy` / `medium` / `hard`), plus the rotation fields `rotation_members UUID[]`, `current_assignee_index`, `last_rotated_at`, and completion fields `completed`, `completed_by`, `completed_at`.
+
+A chore rotates only when `recurrence != 'none'` **and** `rotation_members` is non-empty. The app keeps `assigned_to = [rotation_members[current_assignee_index]]` in sync.
+
+### `chore_completions`
+The accountability ledger, one row per rotation period.
+
+| Column | Notes |
+| --- | --- |
+| `chore_id`, `flat_id`, `assigned_to` | Who was responsible for this period |
+| `completed_by`, `completed_at` | `NULL` when missed |
+| `status` | `completed`, `missed`, or `completed_late` |
+| `points_awarded` | Snapshot of `chores.points` at the time |
+| `period_start`, `period_end` | Previous and current `last_rotated_at` |
+
+## Finance
+
+### `expenses`
+`title`, `amount`, `paid_by`, `entered_by`, `split_between UUID[]`, `category`, `notes`, `settled BOOLEAN`, plus two JSONB columns that carry the real complexity:
+
+- `itemized_details` - array of `{ user_id, amount, description? }` when `itemized = true`.
+- `settlement_status` - array of `{ user_id, amount_owed, amount_paid, status, settled_at?, note? }` where `status` is `pending`, `partial`, or `settled`.
+
+An expense flips `settled = true` only when every entry in `settlement_status` reads `settled`.
+
+### `settlements`
+An immutable record of one payment: `payer_id`, `payee_id`, `amount`, `expense_ids UUID[]`, `reciprocal_deductions JSONB`, `note`.
+
+## Lists
+
+`shopping_lists` and `todo_lists` are per-flat named lists, each with an `is_default` row created on demand by `ensure_default_shopping_list` / `ensure_default_todo_list`.
+
+| Table | Purpose |
+| --- | --- |
+| `shopping_list` | Items: `item`, `quantity`, `bought`, `bought_by`, `added_by`, `list_id`, `position` |
+| `shopping_favorites` | Pinned and auto-suggested items, with `purchase_count`, `is_manual`, `is_removed` |
+| `shopping_purchase_history` | Every purchase, feeding the recommendation counts |
+| `todos` | `task`, `completed`, `priority` (`low` / `medium` / `high`), `position`, `list_id` |
+| `todo_favorites`, `todo_completion_history` | Same pattern as shopping |
+
+<Note>
+  The item table is singular (`shopping_list`) while the list table is plural (`shopping_lists`). This is a historical wart, not a typo. Read carefully when writing queries.
+</Note>
+
+## Reminders and polls
+
+### `reminders`
+`title`, `date`, `recurring`, `recurrence` (`none` / `daily` / `weekly` / `monthly`), `recurrence_interval`, `day_of_week`, `time_of_day`, `notify_users UUID[]`, `notified`, and `next_notify_at` - the column the reminder sweep actually queries.
+
+### `polls`
+`question`, `options TEXT[]`, and `votes JSONB` shaped as `{ [option]: user_id[] }`.
+
+## Notifications
+
+| Table | Purpose |
+| --- | --- |
+| `notifications` | The queue and the in-app inbox. `type`, `title`, `body`, `data JSONB`, `read`, `sent` |
+| `notification_settings` | Per-user category toggles: `chores`, `expenses`, `reminders`, `polls`, `todos`, `shopping`, plus `push_enabled` |
+| `push_subscriptions` | One row per device: `endpoint`, `p256dh_key`, `auth_key`, `device_info`, `last_used_at` |
+
+## Gamification
+
+| Table | Purpose |
+| --- | --- |
+| `badges` | Static catalogue: streak, XP, and milestone badges |
+| `user_badges` | Awarded badges, per user per flat |
+| `user_streaks` | `current_streak_weeks`, `last_evaluated_at`, `last_bonus_month` |
+| `bounties` | Flat-defined optional tasks with an `easy` / `medium` / `hard` difficulty |
+| `bounty_completions` | One claim per user per bounty per day, with XP and coins awarded |
+| `daily_login_claims` | One row per user per flat per day; records the wheel `segment` and rewards |
+| `cosmetic_items` | Catalogue of titles, colours, frames, effects, and emoji with a `rarity` |
+| `user_inventory` | Owned cosmetics, with `earned_from` |
+| `case_openings` | Audit log of case results |
+
+## Entity relationships
+
+```text
+auth.users ──1:1── users_profile ──active_flat_id──▶ flats
+                        │                              │
+                        └──────── flat_members ────────┘
+                                                       │
+     ┌───────────────┬───────────────┬─────────────────┼──────────────┬─────────────┐
+     ▼               ▼               ▼                 ▼              ▼             ▼
+  chores         expenses      shopping_lists      todo_lists     reminders      polls
+     │               │               │                 │
+     ▼               ▼               ▼                 ▼
+chore_completions settlements  shopping_list         todos
+                                shopping_favorites   todo_favorites
+                                shopping_purchase_history  todo_completion_history
+```
+
+Gamification tables hang off `users_profile` and `flats` rather than off any feature table, which is why XP survives leaving a flat but streaks and bounty claims do not.
