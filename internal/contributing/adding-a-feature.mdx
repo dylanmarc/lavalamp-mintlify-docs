@@ -1,0 +1,224 @@
+---
+title: "Adding a feature"
+description: "End-to-end recipe for a new flat-scoped feature, from migration to route."
+noindex: true
+---
+
+Worked example: a shared **house rules** list.
+
+## 1. Migration
+
+```bash
+npx supabase migration new add_house_rules
+```
+
+```sql
+CREATE TABLE IF NOT EXISTS public.house_rules (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  flat_id    UUID NOT NULL REFERENCES public.flats(id) ON DELETE CASCADE,
+  rule       TEXT NOT NULL,
+  created_by UUID REFERENCES auth.users(id),
+  position   INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_house_rules_flat_id ON public.house_rules(flat_id);
+
+ALTER TABLE public.house_rules ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Members read house rules" ON public.house_rules;
+CREATE POLICY "Members read house rules" ON public.house_rules
+  FOR SELECT USING (flat_id IN (SELECT get_user_flat_ids()));
+
+DROP POLICY IF EXISTS "Members write house rules" ON public.house_rules;
+CREATE POLICY "Members write house rules" ON public.house_rules
+  FOR ALL USING (flat_id IN (SELECT get_user_flat_ids()));
+
+ALTER PUBLICATION supabase_realtime ADD TABLE public.house_rules;
+```
+
+```bash
+npx supabase db reset   # prove it replays from empty
+```
+
+## 2. Type
+
+```ts
+// src/types/index.ts
+export interface HouseRule {
+  id: string;
+  flat_id: string;
+  rule: string;
+  created_by?: string;
+  position: number;
+  created_at: string;
+}
+```
+
+Column names exactly as in SQL. No camelCasing.
+
+## 3. Query keys
+
+```ts
+// src/lib/queryKeys.ts
+houseRules: (flatId: string) => ['houseRules', flatId] as const,
+houseRulesAll: ['houseRules'] as const,
+```
+
+## 4. Hook
+
+```ts
+// src/hooks/useHouseRules.ts
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { supabase } from '@/lib/supabase';
+import { queryKeys } from '@/lib/queryKeys';
+import { cancelAndSnapshot, rollback, optimisticUpdateList, tempId } from '@/lib/optimisticMutations';
+import { toast } from '@/lib/toast';
+import type { HouseRule } from '@/types';
+
+export function useHouseRules(flatId: string) {
+  return useQuery({
+    queryKey: queryKeys.houseRules(flatId),
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('house_rules')
+        .select('*')
+        .eq('flat_id', flatId)
+        .order('position', { ascending: true });
+      if (error) throw error;
+      return data as HouseRule[];
+    },
+    enabled: !!flatId,
+  });
+}
+
+export function useCreateHouseRule() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: Omit<HouseRule, 'id' | 'created_at'>) => {
+      const { data, error } = await supabase
+        .from('house_rules').insert(input).select().single();
+      if (error) throw error;
+      return data as HouseRule;
+    },
+
+    onMutate: async (variables) => {
+      const key = queryKeys.houseRules(variables.flat_id);
+      const { previous } = await cancelAndSnapshot<HouseRule[]>(queryClient, key);
+
+      const optimistic: HouseRule = {
+        ...variables,
+        id: tempId('temp-rule-'),
+        created_at: new Date().toISOString(),
+      };
+
+      optimisticUpdateList<HouseRule, typeof variables>(queryClient, key, variables, {
+        add: (old) => [...old, optimistic],
+      });
+
+      return { previous, key };
+    },
+
+    onError: (_err, _vars, ctx) => {
+      if (ctx?.key) rollback(queryClient, ctx.key, ctx.previous);
+      toast.error('Could not add that rule');
+    },
+
+    onSettled: (_data, _err, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.houseRules(variables.flat_id) });
+    },
+  });
+}
+```
+
+## 5. Page
+
+```tsx
+// src/pages/HouseRules.tsx
+export default function HouseRules() {
+  const { data: flat } = useFlat();
+  const { data: rules, isLoading } = useHouseRules(flat?.id ?? '');
+  const [showForm, setShowForm] = useState(false);
+
+  useSupabaseRealtime({
+    table: 'house_rules',
+    flatId: flat?.id ?? '',
+    queryKeyBase: queryKeys.houseRulesAll,
+  });
+
+  if (isLoading) return <LoadingState />;
+
+  return (
+    <div className="p-6 pb-24">
+      <h1 className="text-2xl font-semibold">House rules</h1>
+      {!rules?.length
+        ? <EmptyState title="No rules yet" description="Agree on something and write it down." />
+        : rules.map((r) => <RuleCard key={r.id} rule={r} />)}
+      <FloatingActionButton onClick={() => setShowForm(true)} label="Add rule" />
+    </div>
+  );
+}
+```
+
+## 6. Route
+
+```tsx
+// src/App.tsx - inside the ProtectedRoute + Layout block
+<Route path="/house-rules" element={<HouseRules />} />
+```
+
+Add the nav entry in `src/components/layout/Layout.tsx`.
+
+## 7. Notifications, if needed
+
+Only if the feature genuinely warrants interrupting someone. If it does, queue from a DB trigger:
+
+```sql
+CREATE OR REPLACE FUNCTION public.notify_new_house_rule()
+RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE m RECORD;
+BEGIN
+  FOR m IN
+    SELECT user_id FROM flat_members
+    WHERE flat_id = NEW.flat_id AND status = 'active' AND user_id <> NEW.created_by
+  LOOP
+    PERFORM queue_notification(
+      m.user_id, 'general', 'New house rule', NEW.rule,
+      jsonb_build_object('rule_id', NEW.id), NEW.flat_id
+    );
+  END LOOP;
+  RETURN NEW;
+END;
+$$;
+```
+
+A new category (rather than `general`) means a column on `notification_settings`, a branch in `process-notifications`, and an entry in `src/config/notifications.ts`.
+
+## Checklist
+
+<Steps>
+  <Step title="Migration">
+    Idempotent, `flat_id` present, RLS enabled with policies for every verb, Realtime publication added, replays from empty.
+  </Step>
+  <Step title="Types">
+    Interface added, column names matching SQL exactly.
+  </Step>
+  <Step title="Keys">
+    Both the scoped factory and the `All` prefix.
+  </Step>
+  <Step title="Hook">
+    `enabled: !!flatId`, optimistic helpers, invalidate in `onSettled`, human-readable toast on error.
+  </Step>
+  <Step title="Page">
+    Loading state, empty state, FAB for the create action, phone-width layout, both themes.
+  </Step>
+  <Step title="Route and nav">
+    Inside `ProtectedRoute` and `Layout`, with a nav entry.
+  </Step>
+  <Step title="Verify">
+    `npm run check`, then exercise it with two accounts in one flat.
+  </Step>
+</Steps>

@@ -1,0 +1,116 @@
+---
+title: "Local development"
+description: "Running FlatApp against a local Supabase stack."
+noindex: true
+---
+
+## Prerequisites
+
+Node 18+, Docker (for the Supabase stack), and the Supabase CLI (already a dev dependency, so `npx supabase` works without a global install).
+
+## First run
+
+```bash
+git clone https://github.com/dylanmarc/flatapp-v2
+cd flatapp-v2
+npm install
+
+npx supabase start      # boots Postgres, Auth, Studio, Mailpit
+npm run use:local       # point .env.local at the local stack
+npm run dev
+```
+
+`supabase start` prints the local anon key on first boot. Put it in `.env.dev` so `npm run use:local` picks it up next time.
+
+| Service | URL |
+| --- | --- |
+| App | http://localhost:5173 |
+| Supabase Studio | http://127.0.0.1:54323 |
+| Mailpit (catches auth emails) | http://127.0.0.1:54324 |
+| API | http://127.0.0.1:54321 |
+| Postgres | 127.0.0.1:54322 |
+
+Ports come from `supabase/config.toml`. Note `enable_confirmations = false` locally, so signup does not require clicking a link - but the email still lands in Mailpit if you want to test the flow.
+
+Or in one command:
+
+```bash
+npm run dev:local       # supabase start + vite, concurrently
+```
+
+## Daily commands
+
+```bash
+npx supabase status             # URLs and keys
+npx supabase stop               # stop, keep data
+npx supabase stop --no-backup   # stop and wipe
+npm run db:reset                # wipe and replay every migration
+npm run check                   # eslint + tsc -b
+```
+
+## Seeding
+
+`supabase/seed.sql` runs on `db reset`. `spoof.sql` at the repo root has helpers for creating test users and flats.
+
+A useful local setup is two accounts in one flat, so you can exercise the two-sided flows - settlement confirmation, chore rotation between members, poll voting - in two browser profiles side by side. Most bugs in this app only appear with more than one member.
+
+## Working against production data
+
+```bash
+npm run use:prod
+npm run dev
+```
+
+<Warning>
+  This is the real production database with your real user account. Every write is live and visible to real flatmates. Use it to reproduce a reported bug, then switch back with `npm run use:local` before you start changing things.
+</Warning>
+
+## Edge Functions locally
+
+```bash
+npx supabase functions serve <name>
+```
+
+They need their secrets present. Create `supabase/.env.local` (gitignored) with `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `APP_ORIGIN`, and any Stripe keys the function reads.
+
+Run the one unit test in the repo:
+
+```bash
+cd supabase/functions/chore-daily-job
+deno test
+```
+
+## Testing push on a phone
+
+Push needs HTTPS and, on iOS, a PWA installed to the home screen.
+
+```bash
+npm run dev:tunnel          # localtunnel
+npm run dev:tunnel:ngrok    # ngrok, if localtunnel is flaky
+```
+
+Then set `APP_ORIGIN` on the Supabase project you are pointed at to the tunnel URL, open it on the phone, add to home screen, and enable notifications. `test-push` is the fastest way to confirm the chain works.
+
+<AccordionGroup>
+  <Accordion title="Infinite loading through the tunnel">
+    Almost always a stale service worker. Clear site data, unregister the worker in DevTools → Application → Service Workers, reload.
+  </Accordion>
+  <Accordion title="Precache manifest is empty">
+    Expected in dev. Precaching only happens in a production build.
+  </Accordion>
+  <Accordion title="HMR websocket fails through the tunnel">
+    Cosmetic. Hot reload stops working; the app is fine. Refresh manually.
+  </Accordion>
+  <Accordion title="Tunnel URL changes every restart">
+    It does. `npm run dev:tunnel:lt` requests the `flatapp` subdomain, which helps when it is free. Otherwise update `APP_ORIGIN` each session.
+  </Accordion>
+</AccordionGroup>
+
+## Troubleshooting
+
+| Symptom | Cause |
+| --- | --- |
+| `supabase start` hangs | Docker is not running, or ports 54321-54324 are taken |
+| Queries return nothing locally | RLS with no matching membership. Check you actually joined the flat with this account |
+| Types disagree with the database | `src/types/index.ts` is hand-maintained; update it |
+| Migrations conflict on reset | Two branches created migrations with overlapping timestamps. Rename one so ordering is unambiguous |

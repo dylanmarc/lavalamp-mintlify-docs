@@ -1,0 +1,80 @@
+---
+title: "Reminders and polls"
+description: "Recurrence scheduling for reminders, and the JSONB vote model for polls."
+noindex: true
+---
+
+## Reminders
+
+**Route:** `/reminders` · **Hook:** `src/hooks/useReminders.ts`
+
+### The scheduling column
+
+A reminder has `date`, `recurrence`, `recurrence_interval`, `day_of_week`, and `time_of_day` - but the sweep queries exactly one column: **`next_notify_at`**.
+
+Everything else is input to computing it. This keeps the 15-minute cron a single indexed comparison instead of recurrence arithmetic across every row.
+
+```sql
+SELECT * FROM reminders WHERE next_notify_at <= now() + interval '30 minutes';
+```
+
+<Warning>
+  A reminder with a null `next_notify_at` will never fire, regardless of how correct its `date` and `recurrence` look. If a reminder is silent, check that column first. It is set on insert and advanced by `reminder-notifications`.
+</Warning>
+
+### Recurrence
+
+| `recurrence` | Behaviour |
+| --- | --- |
+| `none` | Fires once; `notified` is set and `next_notify_at` cleared |
+| `daily` | Advances by `recurrence_interval` days |
+| `weekly` | Advances to the next `day_of_week`, stepping `recurrence_interval` weeks |
+| `monthly` | Advances by `recurrence_interval` months |
+
+`time_of_day` sets the local time of day. Added in `20250128000000_reminders_recurrence_and_next_notify.sql`.
+
+### Recipients
+
+`notify_users UUID[]` limits who is notified. Null means every active member. The sweep queues one `reminders` notification per recipient (`20260227030852_add_reminders_notify_users.sql`).
+
+### Timing characteristics
+
+The cron runs every 15 minutes and looks 30 minutes ahead, so a reminder can arrive up to about 15 minutes **early** and should never arrive late. If the cron stalls, reminders queue up and all fire on the next successful run - they are not skipped.
+
+### UI
+
+Create and delete only. There is no edit; changing a reminder means deleting and recreating it. `UpcomingReminders` on the dashboard reads the same data.
+
+## Polls
+
+**Route:** `/polls` · **Hook:** `src/hooks/usePolls.ts`
+
+### The vote model
+
+```sql
+question  TEXT
+options   TEXT[]
+votes     JSONB   -- { "Option A": ["user-1", "user-2"], "Option B": ["user-3"] }
+```
+
+Votes are a JSONB map from **option string** to an array of user ids. Consequences worth knowing:
+
+<AccordionGroup>
+  <Accordion title="Options are identified by their text">
+    Editing an option's wording orphans its votes, because the key no longer matches. The UI does not offer option editing for this reason.
+  </Accordion>
+  <Accordion title="A vote is a whole-object write">
+    Casting a vote replaces the entire `votes` object. Two people voting within the same round trip can lose one of the votes. Realtime plus optimistic updates make this rare in practice but it is not impossible - if polls ever need to be authoritative, move voting into an RPC that mutates the JSONB server-side.
+  </Accordion>
+  <Accordion title="Multi-select is structural">
+    Nothing stops a user id appearing under two options. Single-choice is enforced in the UI, not in the schema.
+  </Accordion>
+</AccordionGroup>
+
+### Notifications
+
+`notify_flat_new_poll` fires on insert and queues a `polls` notification for every active member **except the creator** - `20260228101156_fix_poll_notifications_exclude_creator.sql` fixed the original version, which notified everyone including the person who had just clicked Create.
+
+### UI
+
+Compact accordion cards with a modal creation form. Results render as percentages and update live via Realtime. Deleting a poll deletes its votes with it.

@@ -1,0 +1,133 @@
+---
+title: "Expenses and settlements"
+description: "Splitting, balance calculation, and the two-sided settlement flow."
+noindex: true
+---
+
+**Route:** `/expenses` · **Hooks:** `src/hooks/useExpenses.ts` · **Logic:** `src/lib/financeUtils.ts`
+
+This is the feature where correctness matters most. A chore reminder arriving late is an annoyance; a balance that is wrong by a dollar makes people stop trusting the app.
+
+## Splitting
+
+An expense is either evenly split or itemised.
+
+### Even split
+
+```ts
+const perPersonAmount = splitBetween.length > 0
+  ? expense.amount / (splitBetween.length + 1)
+  : 0;
+```
+
+<Warning>
+  **`split_between` excludes the payer.** The `+ 1` adds the payer's own share back into the divisor. A $30 expense paid by Alice with `split_between: [bob, carol]` is $10 each across three people - Bob owes $10, Carol owes $10, Alice absorbs $10. Reading `split_between` as "everyone involved" gives you $15 each and a wrong balance.
+</Warning>
+
+### Itemised
+
+`itemized = true` and `itemized_details` carries `{ user_id, amount, description? }` per person. Here the amounts are literal, not derived. `validateItemizedTotal` checks the parts against `amount` before submission.
+
+Both paths funnel through `calculatePerPersonSplit(expense)`, which returns a `{ user_id: amount }` map. Use it rather than re-deriving a split anywhere else.
+
+## Balances
+
+| Function | Returns |
+| --- | --- |
+| `calculateOwing(expenses, userId)` | Debts this user owes |
+| `calculateOwedToUser(expenses, userId)` | Debts owed to this user |
+| `calculateNetBalance(expenses, userId)` | `{ totalOwed, totalOwedToMe, netBalance, breakdown }` |
+| `groupDebtsByPayee(debts)` | Debts keyed by counterparty |
+| `calculateReciprocalDebts(...)` | Per-payee offsets before settling |
+| `filterAndSortExpenses(expenses, userId)` | Only expenses the user is party to |
+
+`netBalance = totalOwedToMe - totalOwed`, and `breakdown` is per person: negative means you owe them, positive means they owe you.
+
+`calculateReciprocalDebts` exists so that when Alice owes Bob $40 and Bob owes Alice $15, the settlement UI can show $25 net rather than asking for two transfers. The offsets are recorded in `settlements.reciprocal_deductions`.
+
+## Settlement: a two-sided flow
+
+Money moving in the real world is not something the app can observe, so settlement is deliberately two-sided. One person asserts they paid; the other confirms they received it.
+
+```text
+Payer                                          Payee
+  │                                              │
+  │ Balances tab → select debts → Settle         │
+  ▼                                              │
+create_settlement_bulk                           │
+  • insert settlements row                       │
+  • set each expense's settlement_status         │
+    entry for the payer to 'pending'             │
+  │                                              │
+  ├── notify_payee_settlement_submitted ────────▶│ "Payment submitted"
+  │                                              │
+  │                          Expenses tab shows  │
+  │                          Pending Confirmations banner
+  │                                              ▼
+  │                                   confirm_settlement_batch
+  │                                     • entries → 'settled'
+  │                                     • if all settled,
+  │                                       expenses.settled = true
+  │◀──────── Realtime ───────────────────────────┤
+  ▼                                              ▼
+Both see settled
+```
+
+### `settlement_status`
+
+A JSONB array on each expense, one entry per debtor:
+
+```json
+{
+  "user_id": "…",
+  "amount_owed": 10.00,
+  "amount_paid": 10.00,
+  "status": "pending",
+  "settled_at": null,
+  "note": "Venmo"
+}
+```
+
+`status` is `pending`, `partial`, or `settled`. The expense's own `settled` boolean flips to `true` only when **every** entry reads `settled`. Never set `expenses.settled` directly - let `confirm_settlement_batch` derive it, or the flag and the array disagree.
+
+Updates replace the whole array atomically. `applySettlementToExpenseStatus` in `financeUtils.ts` computes the new array and is shared between the server call and the optimistic update, so both sides produce identical results.
+
+## Hooks
+
+| Hook | Purpose |
+| --- | --- |
+| `useExpenses(flatId, currentUserId)` | List, filtered to expenses the user is party to |
+| `useCreateExpense` / `useUpdateExpense` / `useDeleteExpense` | CRUD |
+| `useCreateSettlement` | `create_settlement_bulk` |
+| `useConfirmSettlement` | Confirm one |
+| `useConfirmSettlementBatch` | `confirm_settlement_batch` for several at once |
+| `useSettleExpense` | Direct settle on a single expense |
+| `useSettlements(flatId)` | Settlement history |
+
+The query key includes `currentUserId` (`queryKeys.expenses(flatId, userId)`) because the filtering is per-user. Invalidate with `queryKeys.expensesAll` when you need every variant.
+
+## Components
+
+`BalancesView`, `ExpenseCard`, `ExpenseForm`, `ItemizedGrid`, `SettlementModal` in `src/components/expenses/`; `ExpenseSummaryCard` on the dashboard.
+
+Realtime runs on `expenses` and `settlements` with a debounce - this is the table where an un-debounced invalidation most visibly flickers a balance mid-write.
+
+## Gotchas
+
+<AccordionGroup>
+  <Accordion title="The payer is not in split_between">
+    Repeated because it is the mistake that costs the most. See the even-split warning above.
+  </Accordion>
+  <Accordion title="Settlements are immutable">
+    There is no edit or delete. A mistaken settlement is corrected with a compensating expense, which keeps the audit trail intact.
+  </Accordion>
+  <Accordion title="expenses.settled is derived">
+    It is a cache of "every settlement_status entry is settled". Writing it directly desynchronises the two.
+  </Accordion>
+  <Accordion title="Rounding">
+    A three-way split of $10 is $3.33 each with a cent unaccounted for. All rounding lives in `financeUtils.ts` so it is at least consistent; do not add a second rounding site in a component.
+  </Accordion>
+  <Accordion title="entered_by is not paid_by">
+    `entered_by` records who typed the expense in, added by `20260302224405_add_entered_by_to_expenses.sql`. `paid_by` is who actually paid. One person can log an expense on another's behalf.
+  </Accordion>
+</AccordionGroup>

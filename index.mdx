@@ -1,20 +1,56 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "FlatApp internal docs"
+description: "Engineering reference for FlatApp: architecture, data model, backend jobs, and operations."
+noindex: true
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+FlatApp is a Progressive Web App for shared households. A **flat** is the tenancy unit: every chore, expense, list, reminder and poll is scoped to one flat, and every user sees only the flats they are an active member of.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+This site has two tabs:
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+<CardGroup cols={2}>
+  <Card title="Internal" icon="wrench" href="/internal/architecture">
+    Engineering reference. Architecture, schema, RPCs, Edge Functions, environments, and runbooks. Not for customers.
+  </Card>
+  <Card title="User guide" icon="book-open" href="/user-guide/introduction">
+    Customer-facing help content. Written to be published as-is once the site goes public.
+  </Card>
+</CardGroup>
+
+<Warning>
+  **This whole site is private.** Every page carries `noindex: true`, and the deployment should stay behind Mintlify access control until you decide to publish. See [Publishing the docs](/internal/contributing/documentation#going-public) before removing either.
+</Warning>
+
+## Start here
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="sitemap" href="/internal/architecture">
+    How the React client, Supabase Postgres, Edge Functions, and cron jobs fit together.
+  </Card>
+  <Card title="Data model" icon="database" href="/internal/data-model">
+    Every table, what it stores, and how it is scoped to a flat.
+  </Card>
+  <Card title="Local development" icon="laptop-code" href="/internal/ops/local-development">
+    Boot a local Supabase stack and run the app against it.
+  </Card>
+  <Card title="Runbook" icon="fire-extinguisher" href="/internal/ops/runbook">
+    What to check when push notifications, rotation, or settlements misbehave.
+  </Card>
+</CardGroup>
+
+## The shape of the system in one paragraph
+
+The client is a React 19 + TypeScript SPA built with Vite and served from Vercel. It talks directly to Supabase over the JS client: Postgres for storage, Row Level Security for authorisation, Realtime for live updates, and Auth for sessions. Anything that needs privilege the browser must not have (sending push, charging a card, deleting an account, rotating chores on a schedule) lives in a Supabase Edge Function or a `SECURITY DEFINER` Postgres function. Two scheduled jobs drive everything time-based: `chore-daily-job` once a day and `reminder-notifications` every fifteen minutes.
+
+## Conventions used across these docs
+
+| Term | Meaning |
+| --- | --- |
+| **Flat** | A household. The tenancy boundary for all data and all RLS policies. |
+| **Member** | A row in `flat_members` with `status = 'active'`. A user can belong to several flats and has one `active_flat_id`. |
+| **Queue then process** | The only sanctioned way to send a notification. Never call `send-push-notification` directly for user content. |
+| **Optimistic mutation** | Every write goes through the helpers in `src/lib/optimisticMutations.ts` so the UI updates before the server confirms. |
+
+<Info>
+  Source of truth is always the repository: [`dylanmarc/flatapp-v2`](https://github.com/dylanmarc/flatapp-v2). Where these docs and the code disagree, the code wins - and the page is wrong and should be fixed.
+</Info>

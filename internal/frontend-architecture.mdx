@@ -1,0 +1,97 @@
+---
+title: "Frontend architecture"
+description: "How the React app is layered and where each kind of logic belongs."
+noindex: true
+---
+
+## Layers
+
+```text
+pages/         Route components. Compose, decide layout, own local UI state.
+components/    Presentational and feature components. Props in, callbacks out.
+hooks/         All Supabase access. One module per feature domain.
+lib/           Client, query keys, optimistic helpers, formatting, push, sounds.
+stores/        Zustand. Client-only state that outlives a component.
+types/         Shared interfaces, mirroring the database.
+```
+
+The rule that keeps this honest: **pages and components never import `supabase`**. If a component needs data, it calls a hook. This is what makes it possible to change how a query works without auditing every render site.
+
+## Routing and the auth gate
+
+`src/App.tsx` splits on `useAuth()`:
+
+- **Loading** - full-screen spinner.
+- **Signed out** - only `/login`, `/register`, `/forgot-password`, `/reset-password`, `/join`, `/terms`, `/privacy`, `/support`, `/delete-account`. Everything else redirects to `/login`.
+- **Signed in** - `/flats` sits outside the shell (you can be signed in with no active flat), everything else renders inside `ProtectedRoute` → `Layout`.
+
+Two small components handle the invite flow across the auth boundary:
+
+| Component | Role |
+| --- | --- |
+| `SaveInviteAndRedirect` | Signed-out visit to `/join?token=...`. Stashes the token in `sessionStorage` and sends them to login. |
+| `PendingInviteRedirect` | Runs once after sign-in. If a pending token exists, navigates to `/join?token=...` so the join completes. |
+
+<Note>
+  This is why an invite link works for someone who has never used FlatApp: the token survives the register-and-confirm round trip in `sessionStorage` rather than being lost on redirect.
+</Note>
+
+## State: which tool for what
+
+<Tabs>
+  <Tab title="TanStack Query">
+    Anything that lives in Postgres. Queries, mutations, cache, invalidation. Default `staleTime` is 5 minutes with `retry: 1` (`src/lib/queryClient.ts`).
+
+    Five minutes is generous because Realtime invalidates aggressively - the stale time only matters when no one else is changing anything.
+  </Tab>
+  <Tab title="Zustand">
+    Client-only state that must survive navigation. Four stores:
+
+    | Store | Holds |
+    | --- | --- |
+    | `useThemeStore` | Light/dark preference, persisted |
+    | `useUIStore` | Modal and panel state |
+    | `useExpenseStore` | Active tab, search term, filters, selected expense ids |
+    | `useNotificationStore` | Bell panel open state |
+  </Tab>
+  <Tab title="useState">
+    Everything else. Form drafts, open accordions, hover state. If it dies with the component, it belongs here.
+  </Tab>
+</Tabs>
+
+## Forms
+
+React Hook Form with a Zod resolver. Validate at the schema, not in the submit handler, so the error messages and the types come from one place.
+
+```ts
+const schema = z.object({
+  title: z.string().min(1, 'Title is required'),
+  amount: z.coerce.number().positive('Amount must be greater than zero'),
+});
+
+const { register, handleSubmit, formState: { errors } } = useForm({
+  resolver: zodResolver(schema),
+});
+```
+
+Client-side validation is a courtesy to the user. It is not security - the authoritative check is the RLS policy or the RPC.
+
+## UI kit
+
+`src/components/ui/` holds the primitives: `Button`, `Card`, `Input`, `Select`, `MultiSelect`, `Textarea`, `Switch`, `Tabs`, `Modal`, `Badge`, `DateInput`, `TimeInput`, `FloatingActionButton`. Compose from these rather than writing raw Tailwind for a control that already exists.
+
+Every create action on a list page uses `FloatingActionButton`. The app is used one-handed on a phone; a submit button at the top of a long scrolling list is unreachable.
+
+## Dark mode
+
+Tailwind with `darkMode: 'class'`. `useThemeStore` toggles the class on `<html>`. Every colour needs a `dark:` variant - check both themes before you consider a component done.
+
+## PWA and offline
+
+`vite-plugin-pwa` generates the service worker and manifest; `public/sw-push-handler.js` adds the push handlers. `public/offline.html` is the fallback shell. The app caches its own assets, so a cold launch works offline, but data requires a connection - there is no offline write queue.
+
+## Error handling
+
+- `ErrorBoundary` (via `react-error-boundary`) wraps the shell so a render crash shows a recovery screen instead of a white page.
+- Sentry is initialised in `src/lib/sentry.ts`.
+- User-visible failures go through `src/lib/toast.ts` (Sonner). Mutations pair `toast.error` in `onError` with `toast.success` in `onSuccess`.

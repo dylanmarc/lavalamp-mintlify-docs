@@ -1,0 +1,119 @@
+---
+title: "Maintaining these docs"
+description: "How this site is structured, how to edit it, and what to do when you want to publish the user guide."
+noindex: true
+---
+
+This site lives in [`dylanmarc/lavalamp-mintlify-docs`](https://github.com/dylanmarc/lavalamp-mintlify-docs), separate from the app repository.
+
+## Structure
+
+```text
+docs.json            Site config: theme, colours, navigation, navbar, footer
+index.mdx            Internal landing page
+internal/            Engineering documentation
+  features/          Per-feature deep dives
+  ops/               Environments, deployment, migrations, runbook
+  contributing/      Workflow, recipes, this page
+user-guide/          Customer-facing help
+  rewards/
+  account/
+logo/, favicon.svg
+.mintignore          Files Mintlify skips
+```
+
+Two tabs, defined under `navigation.tabs` in `docs.json`. A file that is not listed in the navigation does not appear on the site, so adding a page means adding it in both places.
+
+## Editing
+
+```bash
+npm i -g mint
+mint dev          # http://localhost:3000
+```
+
+Pages are MDX with YAML frontmatter:
+
+```mdx
+---
+title: "Page title"
+description: "One sentence that appears in search and previews."
+noindex: true
+---
+```
+
+Mintlify components used here: `Card`, `CardGroup`, `Steps`/`Step`, `Tabs`/`Tab`, `AccordionGroup`/`Accordion`, `Note`, `Tip`, `Warning`, `Info`.
+
+## Writing standards
+
+Inherited from `AGENTS.md` in this repo:
+
+- Active voice, second person.
+- One idea per sentence.
+- Sentence case headings.
+- Bold for UI elements: click **Settings**.
+- Code formatting for file names, commands, paths, and code references.
+
+Two more that matter for this particular site:
+
+<AccordionGroup>
+  <Accordion title="Internal and user-guide voice are different">
+    Internal pages assume an engineer with repository access and should say *why*, including where the code is odd or wrong. User-guide pages assume someone on a phone who wants to split a bill, and must never mention tables, RPCs, or Supabase.
+  </Accordion>
+  <Accordion title="Document the surprising, not the obvious">
+    "`useChores` fetches chores" helps nobody. "`split_between` excludes the payer" saves an afternoon. When you fix a bug caused by a misunderstanding, the fix belongs in the code and the misunderstanding belongs here.
+  </Accordion>
+</AccordionGroup>
+
+## Keeping it true
+
+This site describes a codebase that changes. Update it when you:
+
+- Add or change a table, RPC, or Edge Function.
+- Change a tuned constant - XP, coins, prices, drop rates.
+- Change the branch strategy, an environment, or a scheduled job.
+- Add a user-visible feature, which needs a user-guide page as well.
+
+If a page contradicts the code, the code is right and the page is a bug. Fix it in the same PR where you notice it.
+
+<Note>
+  The app repository still has a `docs/` folder that predates this site. Parts of it are stale - `TECHNICAL_DOCUMENTATION.md` still describes a single-flat model, and `CRON_SETUP_CHORE_DAILY_JOB.md` still recommends a daily schedule the function has since outgrown. Migrate anything useful here and delete the original rather than maintaining two copies.
+</Note>
+
+## Privacy
+
+<Warning>
+  This site is private and should stay private until you decide otherwise.
+</Warning>
+
+Two independent mechanisms:
+
+1. **`noindex: true`** on every page's frontmatter, so search engines do not index them even if the URL leaks.
+2. **Deployment access control** in the Mintlify dashboard, which is what actually prevents access. Configure it under the deployment's authentication settings.
+
+`noindex` is a request to crawlers, not a lock. Access control is the lock. Both should be on.
+
+## Going public
+
+When the user guide is ready to publish:
+
+<Steps>
+  <Step title="Decide how the internal tab is protected">
+    Publishing the deployment publishes both tabs. Either move the internal pages to a separate private deployment, or use Mintlify's authorisation to gate the Internal tab to your team while the User guide tab is public. Verify the gate with a logged-out browser before announcing anything.
+  </Step>
+  <Step title="Remove noindex from user-guide pages only">
+    ```bash
+    # from the repo root
+    find user-guide -name '*.mdx' -exec sed -i '/^noindex: true$/d' {} +
+    ```
+    Leave it in place on `index.mdx` and everything under `internal/`.
+  </Step>
+  <Step title="Re-read every user-guide page as an outsider">
+    Check for internal URLs, repository links, unreleased features, and anything that names a flatmate or a real account.
+  </Step>
+  <Step title="Point the navbar and footer at customer destinations">
+    The navbar currently links to the app repository. That link must not survive going public.
+  </Step>
+  <Step title="Publish and verify">
+    Open the public URL in a private window and confirm you can reach the user guide and cannot reach anything under `/internal`.
+  </Step>
+</Steps>

@@ -1,0 +1,94 @@
+---
+title: "Code conventions"
+description: "House style for the FlatApp codebase."
+noindex: true
+---
+
+## Naming
+
+| Thing | Convention | Example |
+| --- | --- | --- |
+| Components | PascalCase file and export | `ExpenseCard.tsx` |
+| Hooks | `use` prefix, camelCase file | `useChores.ts` |
+| Database columns | `snake_case` | `settlement_status` |
+| TypeScript interfaces | PascalCase, singular | `ChoreCompletion` |
+| RPC parameters | `p_` prefix | `p_flat_id` |
+| Query keys | camelCase factory on `queryKeys` | `queryKeys.choreCompletions(id)` |
+
+Types mirror database column names exactly - `snake_case` inside interfaces. Do not camelCase on the way in; the mapping layer you would need is not worth the churn, and it hides drift between the schema and the types.
+
+## Imports
+
+`@` is aliased to `/src` in both `vite.config.ts` and `tsconfig`. Use it for anything outside the current folder.
+
+```ts
+import { supabase } from '@/lib/supabase';
+import { queryKeys } from '@/lib/queryKeys';
+import type { Chore } from '@/types';
+```
+
+Use `import type` for type-only imports so they are erased cleanly at build time.
+
+## Components
+
+- Props in, callbacks out. A card does not know how to save; it knows how to call `onComplete`.
+- No `supabase` import outside `hooks/` and `lib/`.
+- Reach for `src/components/ui/` before writing a new control.
+- Every list page needs an `EmptyState` and a `LoadingState`. A blank screen and a loading screen must not look the same.
+
+## Styling
+
+Tailwind utilities inline. `clsx` plus `tailwind-merge` (wrapped as `cn` in `src/lib/utils.ts`) for conditional classes.
+
+```tsx
+<div className={cn('rounded-lg p-4', isActive && 'ring-2 ring-blue-500')} />
+```
+
+Every colour needs a `dark:` variant. Mobile-first: write the phone layout, then add `sm:`, `md:`, `lg:`.
+
+## Money
+
+Amounts are `DECIMAL(10,2)` in Postgres and `number` in TypeScript. All arithmetic and rounding lives in `src/lib/financeUtils.ts` - do not compute a split inline in a component. Floating-point rounding differences between two call sites produce balances that disagree by a cent, which erodes trust in the whole feature.
+
+## Dates
+
+- **Luxon** for anything timezone-aware: rotation schedules, reminder windows, the daily job. Always pass the flat's timezone explicitly.
+- **date-fns** for display formatting.
+- Store timestamps as UTC `TIMESTAMPTZ`. Convert at the edges only.
+
+Never use `new Date()` to decide whether something is due. The server's timezone is not the flat's timezone.
+
+## Error messages
+
+Toast copy is for the person holding the phone, not for the developer.
+
+```ts
+// Good
+toast.error('Only the flat admin can change these settings');
+
+// Bad
+toast.error(error.message);  // "new row violates row-level security policy for table \"flats\""
+```
+
+`useUpdateDefaultRotation` shows the pattern: it inspects `error.code === '42501'` and translates it into a sentence a person can act on. Log the raw error for Sentry; show the translation.
+
+## Comments
+
+Comment the *why*, especially where the code looks wrong but is not. The codebase already does this well in a few places worth imitating:
+
+- `useSupabaseRealtime` explains why there is no server-side filter.
+- `chore-daily-job` explains why dates are compared as strings.
+- `getDueDate` explains why `last_rotated_at` is normalised to start-of-local-day.
+
+Each of those comments prevents a well-meaning "cleanup" that would reintroduce a bug.
+
+## Before you push
+
+```bash
+npm run check   # eslint + tsc -b
+npm run build   # the Vercel build runs tsc first; catch it here
+```
+
+<Warning>
+  The dev server does not typecheck. A branch can run perfectly on your machine and fail the Vercel build. `npm run check` is the gate.
+</Warning>

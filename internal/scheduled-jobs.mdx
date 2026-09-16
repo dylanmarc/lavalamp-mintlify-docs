@@ -1,0 +1,114 @@
+---
+title: "Scheduled jobs"
+description: "chore-daily-job and reminder-notifications: what they do, how to schedule them, and how to verify."
+noindex: true
+---
+
+Two jobs drive everything time-based. Neither runs itself - if nothing is hitting their endpoints, chores never rotate and reminders never fire, and the app looks healthy while quietly doing nothing.
+
+## `chore-daily-job`
+
+Despite the name, the current implementation is written to be **safe and self-healing when run hourly**, and hourly is the better schedule.
+
+### What it does per run
+
+<Steps>
+  <Step title="Load work">
+    Selects every chore with `recurrence != 'none'` and a non-null `rotation_members`, then loads `timezone` and `last_chore_job_processed_date` for the flats involved.
+  </Step>
+  <Step title="Compute a per-flat gate">
+    For each flat, converts now into the flat's timezone. Notifications dispatch only when the local hour is `>= 9` **and** `last_chore_job_processed_date` is not already today's local date. So notifications land once per local morning, and a missed 9am run is picked up by the next hourly run instead of being lost.
+  </Step>
+  <Step title="Rotate what is due">
+    `getDueDate` normalises `last_rotated_at` to the start of the local day and adds the recurrence interval (`day_of_week` pins the weekday when set). A chore is due when today's local date string has reached the due local date string. Date-string comparison, not millisecond comparison, is what makes repeated runs in the same day idempotent. Due chores go through the `rotate_chore` RPC, which pushes `last_rotated_at` forward so later runs skip them.
+  </Step>
+  <Step title="Queue chore notifications">
+    Only for chores that are incomplete and have exactly one assignee:
+
+    - **Overdue** - due date already passed. `chore_overdue`.
+    - **Due tomorrow** - due date is tomorrow locally. `chore_due_soon`.
+    - **Due today** - queued with `scheduled_at` set to 5:00pm local, so it lands as an afternoon nudge rather than at 9am. Skipped if 5pm already passed. `chore_due_today`.
+  </Step>
+  <Step title="Stamp and dispatch">
+    Writes `last_chore_job_processed_date` for every flat whose gate opened, then invokes `process-notifications`.
+  </Step>
+</Steps>
+
+### Scheduling
+
+```bash
+curl -X POST 'https://YOUR_PROJECT_REF.supabase.co/functions/v1/chore-daily-job' \
+  -H 'Authorization: Bearer YOUR_SERVICE_ROLE_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{}'
+```
+
+| Schedule | Behaviour |
+| --- | --- |
+| `0 * * * *` (hourly) | Recommended. Every flat gets its 9am-local window regardless of UTC offset, and a failed run self-heals within an hour. |
+| `0 13 * * *` (daily) | The older setup. Works, but a single failed run costs a flat its whole day of notifications, and flats far from UTC+0 get their window at awkward local times. |
+
+Use an external cron service (cron-job.org, GitHub Actions, your host's scheduler) rather than pg_cron. pg_cron additionally depends on `pg_net` and Vault secrets, and when a Vault secret is missing the job fails silently - the most common cause of "rotation just stopped".
+
+<Tip>
+  Send `{"dry_run": true}` to see what would rotate without writing anything. The response reports `dry_run: true`, a `rotated` count, and a `results` array with `would_rotate` per chore.
+</Tip>
+
+### If you use pg_cron anyway
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION IF NOT EXISTS pg_net;
+
+select vault.create_secret('https://YOUR_PROJECT_REF.supabase.co', 'project_url');
+select vault.create_secret('YOUR_SERVICE_ROLE_KEY', 'service_role_key');
+```
+
+Verify both halves exist, because either one missing produces the same silent failure:
+
+```sql
+SELECT jobname, schedule FROM cron.job WHERE jobname = 'chore-daily-job';
+SELECT name FROM vault.decrypted_secrets WHERE name IN ('project_url', 'service_role_key');
+```
+
+## `reminder-notifications`
+
+Runs every 15 minutes.
+
+1. Selects reminders where `next_notify_at <= now + 30 minutes`.
+2. For each, queues a `reminders` notification for every user in `notify_users`, or for all active members when that column is null.
+3. Advances `next_notify_at` for recurring reminders using `recurrence`, `recurrence_interval`, `day_of_week`, and `time_of_day`; one-off reminders are marked `notified`.
+4. Invokes `process-notifications`.
+
+The 30-minute lookahead against a 15-minute cadence means a reminder can arrive up to about 15 minutes early rather than late. That is deliberate: early is useful, late is not.
+
+```bash
+curl -X POST 'https://YOUR_PROJECT_REF.supabase.co/functions/v1/reminder-notifications' \
+  -H 'Authorization: Bearer YOUR_SERVICE_ROLE_KEY' \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+Schedule: `*/15 * * * *`.
+
+## Verifying both jobs are alive
+
+```sql
+-- Chore job: flats should show today's local date
+SELECT name, timezone, last_chore_job_processed_date FROM flats ORDER BY name;
+
+-- Rotation is moving
+SELECT title, last_rotated_at, current_assignee_index
+FROM chores WHERE recurrence <> 'none' ORDER BY last_rotated_at DESC LIMIT 20;
+
+-- Reminders are not piling up in the past
+SELECT count(*) FROM reminders WHERE next_notify_at < now() - interval '1 hour';
+
+-- The queue is draining
+SELECT count(*) FROM notifications WHERE sent = false;
+```
+
+A growing count of unsent notifications means the queue is filling but nothing is processing. A `last_chore_job_processed_date` stuck on an old date means the scheduler is not reaching the function at all.
+
+<Warning>
+  Both jobs authenticate with the **service role key**. Whatever scheduler you use holds a credential with full database access. Keep it in the scheduler's secret store, rotate it if the scheduler is ever compromised, and never put it in a repository or a client-side env var.
+</Warning>

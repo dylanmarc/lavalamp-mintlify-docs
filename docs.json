@@ -1,38 +1,127 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Lava Lamp Docs",
+  "name": "FlatApp Docs",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#3B82F6",
+    "light": "#60A5FA",
+    "dark": "#1D4ED8"
   },
   "favicon": "/favicon.svg",
   "navigation": {
-    "pages": [
+    "tabs": [
       {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
+        "tab": "Internal",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "index",
+              "internal/architecture",
+              "internal/tech-stack",
+              "internal/repo-structure"
+            ]
+          },
+          {
+            "group": "Data and backend",
+            "pages": [
+              "internal/data-model",
+              "internal/security-rls",
+              "internal/database-functions",
+              "internal/edge-functions",
+              "internal/notifications-pipeline",
+              "internal/scheduled-jobs"
+            ]
+          },
+          {
+            "group": "Frontend",
+            "pages": [
+              "internal/frontend-architecture",
+              "internal/data-fetching",
+              "internal/realtime",
+              "internal/conventions"
+            ]
+          },
+          {
+            "group": "Feature internals",
+            "pages": [
+              "internal/features/flats-and-invites",
+              "internal/features/chores",
+              "internal/features/finance",
+              "internal/features/shopping-and-todos",
+              "internal/features/reminders-and-polls",
+              "internal/features/gamification",
+              "internal/features/billing"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "internal/ops/environments",
+              "internal/ops/local-development",
+              "internal/ops/deployment",
+              "internal/ops/migrations",
+              "internal/ops/runbook",
+              "internal/ops/observability"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "internal/contributing/workflow",
+              "internal/contributing/adding-a-feature",
+              "internal/contributing/documentation"
+            ]
+          }
         ]
       },
-      "untitled-page"
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
+      {
+        "tab": "User guide",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "user-guide/introduction",
+              "user-guide/create-or-join-a-flat",
+              "user-guide/install-the-app",
+              "user-guide/notifications"
+            ]
+          },
+          {
+            "group": "Everyday use",
+            "pages": [
+              "user-guide/dashboard",
+              "user-guide/chores",
+              "user-guide/expenses",
+              "user-guide/shopping",
+              "user-guide/todos",
+              "user-guide/reminders",
+              "user-guide/polls"
+            ]
+          },
+          {
+            "group": "Rewards",
+            "pages": [
+              "user-guide/rewards/xp-and-levels",
+              "user-guide/rewards/coins-and-cases",
+              "user-guide/rewards/bounties-and-daily-bonus",
+              "user-guide/rewards/badges-and-streaks",
+              "user-guide/rewards/your-profile"
+            ]
+          },
+          {
+            "group": "Your account",
+            "pages": [
+              "user-guide/account/flat-settings",
+              "user-guide/account/profile-and-login",
+              "user-guide/account/privacy-and-data",
+              "user-guide/account/troubleshooting",
+              "user-guide/account/support"
+            ]
+          }
+        ]
+      }
+    ]
   },
   "logo": {
     "light": "/logo/light.svg",
@@ -41,23 +130,22 @@
   "navbar": {
     "links": [
       {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
+        "label": "App",
+        "href": "https://getflatapp.com"
       }
     ],
     "primary": {
       "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "label": "Repository",
+      "href": "https://github.com/dylanmarc/flatapp-v2"
     }
   },
   "contextual": {
     "options": [
       "copy",
       "view",
-      "chatgpt",
       "claude",
-      "perplexity",
+      "chatgpt",
       "mcp",
       "cursor",
       "vscode"
@@ -65,9 +153,7 @@
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/dylanmarc/flatapp-v2"
     }
   },
   "appearance": {

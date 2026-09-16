@@ -1,0 +1,99 @@
+---
+title: "Flats and invites"
+description: "Membership, multi-flat support, and how invite links are issued and redeemed."
+noindex: true
+---
+
+**Routes:** `/flats`, `/join`, `/settings` · **Hook:** `src/hooks/useFlat.ts`
+
+## The membership model
+
+A user's identity spans flats; their *session context* does not.
+
+| Concept | Stored in |
+| --- | --- |
+| Which flats a user belongs to | `flat_members` rows with `status = 'active'` |
+| Which flat the UI is currently showing | `users_profile.active_flat_id` |
+| The user's role in a given flat | `flat_members.role` |
+
+`useFlat()` resolves the active flat and is the dependency of nearly every other query. `useUserFlats()` lists the user's memberships for the switcher; `useSwitchFlat()` writes `active_flat_id` and invalidates everything flat-scoped.
+
+<Warning>
+  `users_profile.role` still exists and is legacy. Per-flat authorisation reads `flat_members.role` via `is_flat_admin(flat_id)`. Do not add new checks against the profile column.
+</Warning>
+
+### Leaving versus deleting
+
+`useLeaveFlat` calls `cleanup_flat_leave`, which sets `status = 'left'` rather than deleting the row, removes the user from that flat's `rotation_members` and `assigned_to` arrays, and clears `active_flat_id` if it pointed at this flat.
+
+The soft delete exists because `chore_completions.assigned_to`, `expenses.paid_by`, and `settlements.payer_id` all reference the user. Hard-deleting membership would leave history that cannot be rendered. Rejoining reactivates the same row.
+
+## Creating a flat
+
+`useCreateFlat` inserts the flat, creates the creator's `flat_members` row as `admin`, and sets `active_flat_id`. RLS for flat creation was awkward to get right - see `20260306020504_fix_flats_rls_for_creation.sql` and `20260522000001_fix_flats_rls_permissive_policy.sql` before touching those policies.
+
+## Invite links
+
+### Issuing
+
+`useCreateInviteLink` (admin only):
+
+<Steps>
+  <Step title="Generate">
+    `generateRawToken()` produces 128 bits of `crypto.getRandomValues` entropy, base64url encoded. `generateShortCode()` produces a 9-character human-typeable code from an alphabet that omits `0`, `O`, `1`, and `I`.
+  </Step>
+  <Step title="Hash">
+    `hashToken()` SHA-256s the raw token. Only the hash reaches `invite_tokens`.
+  </Step>
+  <Step title="Store">
+    Row carries `short_code`, `expires_at`, `max_uses`, `use_count`, `revoked`.
+  </Step>
+  <Step title="Share">
+    `buildInviteUrl(token)` returns `${origin}/join?token=${token}`. The raw token exists only in that URL.
+  </Step>
+</Steps>
+
+Because only the hash is stored, a leaked database gives an attacker nothing they can redeem, and an admin cannot re-display a link after creating it. Losing the link means revoking and issuing a new one, which is the correct trade.
+
+### Redeeming
+
+```ts
+const token_hash = input.token ? await hashToken(input.token) : undefined;
+const { data, error } = await supabase.rpc('join_by_invite', {
+  p_token_hash: token_hash ?? null,
+  p_short_code: input.short_code ?? null,
+});
+
+if (error) throw new Error(error.message || 'Failed to join flat');
+if (data?.error) throw new Error(data.error);      // RPC reports failure in the payload
+if (!data?.flat) throw new Error('Invalid or expired invite link.');
+```
+
+The RPC checks `revoked`, `expires_at`, `use_count < max_uses`, records an attempt for rate limiting (`invite_join_attempts`, `20260522000002_invite_join_rate_limiting.sql`), then inserts or reactivates membership and sets `active_flat_id`. It returns `{ flat, already_member? }`, and `already_member` is a success path, not an error - `20260506000004_fix_already_member_active_flat.sql` made it also switch the user's active flat.
+
+### Redeeming while signed out
+
+`/join?token=...` for a signed-out visitor hits `SaveInviteAndRedirect`, which stashes the token in `sessionStorage` and sends them to `/login`. After authentication, `PendingInviteRedirect` reads it back and navigates to `/join`, completing the join. `src/lib/pendingInvite.ts` owns that storage.
+
+`get_invite_preview` supplies the flat name for the pre-auth screen. Anonymous access to it is deliberately narrow - check `20260506000003_revoke_anon_invite_preview.sql` before widening it.
+
+### Revoking
+
+`useRevokeInvite` sets `revoked = true`. Existing members are unaffected; only future redemptions fail.
+
+## Flat settings
+
+Admin-only, from `/settings`:
+
+| Setting | Effect |
+| --- | --- |
+| Flat name | Display only |
+| Timezone | **Drives every scheduled behaviour.** Rotation days, the 9am notification window, and the 5pm due-today nudge are all computed in this zone |
+| Default chore rotation | Member order used for new rotating chores. "Apply to all chores" calls `apply_default_rotation_to_chores` and overwrites `rotation_members` on every rotating chore in the flat |
+| Invite links | Create and revoke |
+
+`useUpdateDefaultRotation` translates Postgres error `42501` into "Only the flat admin can update flat settings" rather than surfacing the raw RLS message. Follow that pattern for any other admin-gated write.
+
+<Note>
+  Changing the timezone changes when notifications arrive for everyone in the flat, including the rotation boundary. A flat that moves from `Australia/Melbourne` to `Europe/London` will see one irregular rotation interval as the local date arithmetic re-anchors.
+</Note>

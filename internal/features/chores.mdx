@@ -1,0 +1,133 @@
+---
+title: "Chores and rotation"
+description: "Data model, rotation mechanics, completion history, and XP for the chores feature."
+noindex: true
+---
+
+**Routes:** `/chores`, `/chores/history` · **Hook:** `src/hooks/useChores.ts`
+
+Chores are the feature everything else in FlatApp orbits: they generate most notifications, all the streak logic, and most XP.
+
+## Two kinds of chore
+
+| | Plain | Rotating |
+| --- | --- | --- |
+| Condition | `recurrence = 'none'` or empty `rotation_members` | `recurrence != 'none'` **and** non-empty `rotation_members` |
+| Assignment | Whatever is in `assigned_to` | `assigned_to = [rotation_members[current_assignee_index]]` |
+| Lifecycle | Completed once, stays completed | Rotates on schedule, resetting completion each period |
+| History | None | One `chore_completions` row per period |
+
+The scheduled job only ever looks at rotating chores. A chore that "isn't rotating" almost always fails one of the two conditions - check both before debugging anything else.
+
+## Rotation
+
+`rotate_chore(chore_uuid UUID)` is the only thing that rotates a chore. It runs from two places: the scheduled job, and the manual **Rotate** button (`useManualRotateChore`).
+
+Each call:
+
+1. Writes the closing period's `chore_completions` row - `completed` if the chore was done, `missed` if not, with `period_start` and `period_end` from the old and new `last_rotated_at`.
+2. Advances `current_assignee_index` and sets `assigned_to` to the next member.
+3. Stamps `last_rotated_at = now()`.
+4. Clears `completed`, `completed_by`, `completed_at`.
+
+Step 2 fires the `notify_chore_assignees` trigger, which queues a "Chore assigned" notification. Manual rotation follows up by invoking `process-notifications` so the new assignee hears about it immediately rather than at the next job run.
+
+### When is a rotation due
+
+`getDueDate` in `supabase/functions/chore-daily-job/index.ts`:
+
+```ts
+const last = DateTime.fromISO(chore.last_rotated_at, { zone: 'utc' })
+  .setZone(flatTimezone)
+  .startOf('day');
+```
+
+Normalising to the start of the flat's local day is what makes rotation stable. Without it, a chore completed at 11pm and one completed at 6am would drift apart over weeks of hourly cron fires. `day_of_week` pins the weekday when set; otherwise whatever local weekday the chore last rotated on becomes the anchor, advanced by `recurrence_interval`.
+
+Due-ness is then a **date string comparison**, not a millisecond comparison:
+
+```ts
+return getDateStrInZone(now, tz) >= getDateStrInZone(dueDate, tz);
+```
+
+This is why the job is safe to run hourly: once `rotate_chore` pushes `last_rotated_at` forward, the same day's later runs compute a future due date and skip.
+
+## Completion
+
+`useCompleteChoreWithRotation` is the path the UI uses. The page enforces that only the current assignee can complete - "You can only complete chores assigned to you".
+
+Completion does **not** rotate. It sets `completed`, `completed_by`, `completed_at` and writes a `chore_completions` row; rotation happens later on schedule or by hand. Separating them is what allows a chore to be completed early in a period without stealing the next person's turn.
+
+`useUndoChoreCompletion` reverses a completion, including the XP and coins.
+
+### Late completion
+
+When a period rotates unfinished, its history row is `missed`. The assignee can open the chore's history and hit **Complete Late**: `useCompleteChoreLate` flips that row to `completed_late` and stamps `completed_by` and `completed_at`. The chore's current assignment is untouched - only history changes.
+
+`recalc_late_completion_xp` then applies the late multiplier.
+
+## Rewards
+
+Base rewards come from difficulty (`src/lib/bountyConstants.ts`, mirrored server-side):
+
+| Difficulty | XP | Coins |
+| --- | --- | --- |
+| Easy | 50 | 10 |
+| Medium | 100 | 25 |
+| Hard | 200 | 50 |
+
+Lateness scales XP down (`calculateXP` in `src/lib/xpConstants.ts`):
+
+```ts
+const lateMult = daysLate > 0 ? Math.max(0.20, 1.0 - 0.20 * daysLate) : 1.0;
+return Math.max(1, Math.round(baseXP * lateMult));
+```
+
+So 1 day late is 80%, 2 days 60%, and it floors at 20% - five days late and five weeks late are worth the same. Coins are awarded by the `trg_chore_coins_fn` trigger and are not reduced by lateness.
+
+## Notifications
+
+| Notification | Source | Timing |
+| --- | --- | --- |
+| `chore_assigned` | `notify_chore_assignees` trigger | Immediately on assignment or rotation |
+| `chore_overdue` | `chore-daily-job` | Due date already past, at the flat's 9am local window |
+| `chore_due_soon` | `chore-daily-job` | Due tomorrow, at the 9am window |
+| `chore_due_today` | `chore-daily-job` | Queued with `scheduled_at` = 5pm local on the due day |
+
+All four skip completed chores and chores without exactly one assignee.
+
+## Key hooks
+
+| Hook | Purpose |
+| --- | --- |
+| `useChores(flatId)` | List |
+| `useCreateChore` / `useUpdateChore` / `useDeleteChore` | CRUD |
+| `useCompleteChoreWithRotation` | The completion path used by the UI |
+| `useUndoChoreCompletion` | Reverse a completion and its rewards |
+| `useCompleteChoreLate` | Flip a `missed` history row to `completed_late` |
+| `useManualRotateChore` | `rotate_chore` RPC plus a `process-notifications` invoke |
+| `useUpdateChoreRotation` | Change `rotation_members`; resets index and assignee |
+| `useChoreCompletions(choreId)` | Per-chore history for the modal |
+| `useChoreCompletionHistory(flatId)` | Flat-wide history for `/chores/history` |
+| `useActiveMissedChores(flatId)` | Outstanding `missed` rows the user can still complete late |
+
+## Components
+
+`ChoreCard`, `ChoreForm`, `ChoreHistoryModal` in `src/components/chores/`; `ChoreTimeline` (Recharts stacked bar) in `src/components/dashboard/`.
+
+## Gotchas
+
+<AccordionGroup>
+  <Accordion title="Changing rotation_members resets the turn order">
+    `useUpdateChoreRotation` sets `current_assignee_index = 0` and reassigns to the first member. Adding a flatmate to a rotation restarts the cycle rather than inserting them at the end.
+  </Accordion>
+  <Accordion title="assigned_to is an array with one element">
+    Rotation maintains a single-element array. The notification path skips anything with more than one assignee, so a manually multi-assigned rotating chore silently stops generating reminders.
+  </Accordion>
+  <Accordion title="Rotation and notifications have different gates">
+    Rotation runs whenever the local date is due. Notifications require local hour >= 9 and `last_chore_job_processed_date != today`. A chore can rotate at 2am local and its assignment notification arrive at 9am.
+  </Accordion>
+  <Accordion title="Never write last_rotated_at by hand">
+    It is the anchor for all future due dates. Setting it directly skips the history row and desynchronises the rotation index from `assigned_to`.
+  </Accordion>
+</AccordionGroup>

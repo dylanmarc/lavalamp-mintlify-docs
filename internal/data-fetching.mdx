@@ -1,0 +1,150 @@
+---
+title: "Data fetching and mutations"
+description: "Query keys, the optimistic mutation helpers, and the shape every hook follows."
+noindex: true
+---
+
+## Query keys
+
+Every key is built in `src/lib/queryKeys.ts`. Never inline one.
+
+```ts
+export const queryKeys = {
+  userProfile: ['userProfile'] as const,
+  flat: (flatId?: string) => (flatId ? ['flat', flatId] as const : ['flat'] as const),
+  expenses: (flatId: string, currentUserId?: string) =>
+    currentUserId != null
+      ? (['expenses', flatId, currentUserId] as const)
+      : (['expenses', flatId] as const),
+  expensesAll: ['expenses'] as const,
+  chores: (flatId: string) => ['chores', flatId] as const,
+  choresAll: ['chores'] as const,
+  // ...
+};
+```
+
+The paired `xAll` keys are the prefix form, used when you need to invalidate every variant at once - typically from a Realtime `DELETE`, where the deleted row's `flat_id` is unknowable.
+
+<Warning>
+  An invalidation that does not match the key used by `useQuery` fails silently: no error, no refetch, stale UI. This is the single most common bug in this codebase, and centralising keys is the whole defence against it.
+</Warning>
+
+## The optimistic helpers
+
+`src/lib/optimisticMutations.ts` provides four functions:
+
+| Function | Purpose |
+| --- | --- |
+| `cancelAndSnapshot<T>(client, key)` | Cancel in-flight refetches, return `{ previous }` |
+| `optimisticUpdateList<T, V>(client, key, vars, config)` | Apply exactly one of `add`, `update`, `remove` |
+| `rollback(client, key, previous)` | Restore the snapshot |
+| `tempId(prefix)` | Recognisable temporary id, for example `temp-todo-1717…` |
+
+`optimisticUpdateList` throws if you pass more than one of `add`, `update`, or `remove`. That is deliberate - a mutation that both adds and removes is two mutations.
+
+## The standard mutation shape
+
+```ts
+export function useCreateTodo() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (input: NewTodo) => {
+      const { data, error } = await supabase
+        .from('todos')
+        .insert(input)
+        .select()
+        .single();
+      if (error) throw error;
+      return data;
+    },
+
+    onMutate: async (variables) => {
+      const key = queryKeys.todos(variables.flat_id);
+      const { previous } = await cancelAndSnapshot<Todo[]>(queryClient, key);
+
+      const optimistic: Todo = {
+        ...variables,
+        id: tempId('temp-todo-'),
+        created_at: new Date().toISOString(),
+      };
+
+      optimisticUpdateList<Todo, typeof variables>(queryClient, key, variables, {
+        add: (old) => [optimistic, ...old],
+      });
+
+      return { previous, key };
+    },
+
+    onError: (_err, _variables, ctx) => {
+      if (ctx?.key) rollback(queryClient, ctx.key, ctx.previous);
+      toast.error('Could not add todo');
+    },
+
+    onSettled: (_data, _error, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.todos(variables.flat_id) });
+    },
+  });
+}
+```
+
+Four rules hold for every mutation in the codebase:
+
+<Steps>
+  <Step title="Snapshot before you touch the cache">
+    `cancelAndSnapshot` first, always. Without the cancel, an in-flight refetch can land after your optimistic write and undo it.
+  </Step>
+  <Step title="Return the key from onMutate">
+    `onError` needs it, and deriving it twice risks deriving it differently.
+  </Step>
+  <Step title="Invalidate in onSettled, not onSuccess">
+    `onSettled` runs on both paths, so a failed mutation still reconciles against the server rather than leaving a rolled-back cache that might itself be stale.
+  </Step>
+  <Step title="Never render a temp id as a link target">
+    Temporary ids do not exist server-side. Navigation or a follow-up mutation keyed on one will 404.
+  </Step>
+</Steps>
+
+## Reads
+
+```ts
+export function useTodos(flatId: string) {
+  return useQuery({
+    queryKey: queryKeys.todos(flatId),
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('todos')
+        .select('*')
+        .eq('flat_id', flatId)
+        .order('position', { ascending: true });
+      if (error) throw error;
+      return data;
+    },
+    enabled: !!flatId,
+  });
+}
+```
+
+`enabled: !!flatId` is not optional. `useFlat()` resolves asynchronously, and a query that runs with an empty flat id fires a pointless request and caches an empty array under a key you will later expect to be populated.
+
+Always filter by `flat_id` in the query even though RLS already does. Belt and braces, and it keeps the SQL plan sane.
+
+## RPC mutations
+
+Same shape, different `mutationFn`:
+
+```ts
+const { data, error } = await supabase.rpc('claim_bounty', {
+  p_bounty_id: bountyId,
+  p_user_id: userId,
+  p_completed_date: dateStr,
+});
+if (error) throw error;
+```
+
+Note that many RPCs return a JSONB envelope that reports failure **in the payload** rather than by raising. `join_by_invite` is the clearest case: `error` is null and `data.error` carries the message. Check both.
+
+```ts
+if (error) throw new Error(error.message);
+if (data?.error) throw new Error(data.error);
+```

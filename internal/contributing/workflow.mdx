@@ -1,0 +1,111 @@
+---
+title: "Development workflow"
+description: "Branches, CI, review, and what to run before you push."
+noindex: true
+---
+
+## Branches
+
+```text
+feature/my-feature  ─┐
+fix/some-bug        ─┴─▶ develop ─▶ staging ─▶ main (production)
+```
+
+| Branch | Role |
+| --- | --- |
+| `main` | Production. Merging here deploys. |
+| `staging` | Pre-production verification on a Vercel preview against the staging backend. |
+| `develop` | Integration. Branch from here. |
+| `feature/*`, `fix/*` | Your work. |
+
+## The loop
+
+<Steps>
+  <Step title="Branch from develop">
+    ```bash
+    git checkout develop && git pull
+    git checkout -b feature/my-feature
+    ```
+  </Step>
+  <Step title="Build it locally">
+    Against the local Supabase stack, not production. See [Local development](/internal/ops/local-development).
+  </Step>
+  <Step title="Check before pushing">
+    ```bash
+    npm run check    # eslint + tsc -b
+    npm run build
+    ```
+  </Step>
+  <Step title="Open a PR to develop">
+    CI runs on push and PR against `main` and `develop`.
+  </Step>
+  <Step title="Promote">
+    `develop` → `staging`, verify on the preview, then `staging` → `main`.
+  </Step>
+</Steps>
+
+## CI
+
+`.github/workflows/ci.yml` on Node 20:
+
+| Step | Blocking |
+| --- | --- |
+| `npm ci` | Yes |
+| `npm run lint` | **No** - `continue-on-error: true` |
+| `npx tsc -b` | Yes |
+| `npm run build` | Yes |
+
+<Warning>
+  Lint is non-blocking because of a backlog of pre-existing errors. Do not read a green CI badge as "lint is clean". Run `npm run lint` yourself and at minimum do not add new errors - the flag is meant to be removed once the backlog is cleared, and every new error pushes that further away.
+</Warning>
+
+## Commits
+
+Conventional-ish prefixes, used loosely:
+
+```text
+feat: add priority filter to todos
+fix: correct late XP multiplier floor
+refactor: extract settlement status helper
+docs: document the reminder sweep window
+chore: bump supabase client
+```
+
+Migrations and the type changes that match them belong in the same commit. Splitting them produces a commit where `src/types/index.ts` describes a schema that does not exist yet.
+
+## Review checklist
+
+<AccordionGroup>
+  <Accordion title="Does it touch RLS or a SECURITY DEFINER function?">
+    Security review. Check `SET search_path = public`, check any `p_user_id` is validated against `auth.uid()`, and check new tables have RLS enabled with policies for every verb used.
+  </Accordion>
+  <Accordion title="Does it add a query or mutation?">
+    Key from `queryKeys`, `enabled: !!flatId` on the query, optimistic helpers on the mutation, invalidate in `onSettled`.
+  </Accordion>
+  <Accordion title="Does it add a column?">
+    Migration is additive and idempotent, `src/types/index.ts` updated in the same commit, and the old frontend survives the migration.
+  </Accordion>
+  <Accordion title="Does it change a tuned constant?">
+    XP, coins, prices, thresholds, and drop rates exist in SQL and TypeScript. Both, same commit. See [Gamification](/internal/features/gamification#where-constants-live).
+  </Accordion>
+  <Accordion title="Does it change notifications?">
+    Queue through `queue_notification`, never call `send-push-notification` directly, and make sure something invokes `process-notifications`.
+  </Accordion>
+  <Accordion title="Is it usable?">
+    Phone-width layout, both themes, loading state, empty state, and an error message a person can act on.
+  </Accordion>
+</AccordionGroup>
+
+## Testing
+
+There is one automated test in the repo: `supabase/functions/chore-daily-job/getDueDate.test.ts`.
+
+```bash
+cd supabase/functions/chore-daily-job && deno test
+```
+
+Everything else is manual, which makes the manual pass matter. The two-account local setup described in [Local development](/internal/ops/local-development#seeding) is the only way to exercise settlement confirmation, rotation between members, and poll voting - the flows where the bugs actually are.
+
+<Note>
+  If you are adding logic with tricky edges - date arithmetic, money splitting, XP multipliers - a Deno test next to the code it covers is the cheapest insurance available, and `getDueDate.test.ts` is the pattern to copy.
+</Note>

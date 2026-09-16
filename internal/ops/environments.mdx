@@ -1,0 +1,102 @@
+---
+title: "Environments"
+description: "Branch strategy, Supabase backends, and Vercel configuration for dev, staging, and production."
+noindex: true
+---
+
+## Mapping
+
+| Environment | Git branch | Hosting | Supabase |
+| --- | --- | --- | --- |
+| **Dev** | Local, `develop`, feature branches | `npm run dev` or a Vercel preview | Local stack, or a dev project/branch |
+| **Staging** | `staging` | Vercel preview | Supabase staging branch or `flatapp-staging` project |
+| **Production** | `main` | Vercel production | Production project |
+
+Promotion is one direction: feature branch → `develop` → `staging` → `main`.
+
+## Supabase: two valid models
+
+<Tabs>
+  <Tab title="Branching">
+    Production is the default branch. Create a `staging` branch from it, linked to the `staging` Git branch. Each branch gets its own URL, keys, database, and Edge Function secrets.
+
+    Best when your org has Branching available and you want the schema to track the Git branch.
+  </Tab>
+  <Tab title="Separate projects">
+    `flatapp-prod` and `flatapp-staging` as independent projects. Run the same migrations on each, give each its own VAPID pair and secrets, deploy functions to both.
+
+    Fully isolated, more manual, no plan requirements.
+  </Tab>
+</Tabs>
+
+Either way, **every environment needs its own everything**: migrations applied, Edge Function secrets set, auth URLs configured, cron scheduled.
+
+## Per-environment configuration
+
+### Edge Function secrets
+
+Under **Project settings → Edge Functions → Secrets**:
+
+| Secret | Value |
+| --- | --- |
+| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | One pair per environment (`npx web-push generate-vapid-keys`) |
+| `APP_ORIGIN` or `SITE_URL` | The exact app origin for this environment |
+| `STRIPE_SECRET_KEY` | Live key for production, test key everywhere else |
+| `STRIPE_WEBHOOK_SECRET` | From the webhook endpoint registered for *this* environment |
+
+### Auth URLs
+
+**Authentication → URL configuration** - Site URL and redirect URLs must match the app origin exactly, or password reset and email confirmation links land on the wrong host.
+
+### Cron
+
+Both scheduled jobs need scheduling in every environment you expect them to run in. Staging can use a slower cadence; it just must not be zero if you intend to test rotation there.
+
+## Vercel
+
+Import the repo with the Vite preset. `vercel.json` handles SPA rewrites, including the carve-outs for `/welcome` and `/.well-known/`.
+
+- **Production** ← `main`
+- **Preview** ← every other branch, including `staging`
+
+### Environment variables
+
+Scoped per environment under **Project → Settings → Environment Variables**:
+
+| Variable | Production | Preview |
+| --- | --- | --- |
+| `VITE_SUPABASE_URL` | Production Supabase URL | Staging Supabase URL |
+| `VITE_SUPABASE_ANON_KEY` | Production anon key | Staging anon key |
+| `VITE_VAPID_PUBLIC_KEY` | Production VAPID public | Staging VAPID public |
+
+<Warning>
+  `VITE_VAPID_PUBLIC_KEY` in Vercel must be the public half of the pair whose private half is in that environment's Supabase Edge Function secrets. A mismatch produces subscriptions that are created successfully and then never deliver anything - the failure mode with the least useful error message in the entire system.
+</Warning>
+
+Anything prefixed `VITE_` is compiled into the client bundle and is public. Never put a service-role key, a VAPID private key, or a Stripe secret behind that prefix.
+
+## Local
+
+`.env.local` is gitignored. `npm run use:local` and `npm run use:prod` copy `.env.dev` or `.env.prod` over it.
+
+For push testing locally, set the dev Supabase project's `APP_ORIGIN` to your tunnel URL and run `npm run dev:tunnel`. Push requires HTTPS; `http://localhost:5173` will not do.
+
+## Verification checklist
+
+<Steps>
+  <Step title="Branches">
+    `main`, `staging`, and optionally `develop` exist and are pushed.
+  </Step>
+  <Step title="Supabase per environment">
+    Migrations applied, Edge Function secrets set, `APP_ORIGIN` and auth URLs matching that environment's app URL.
+  </Step>
+  <Step title="Vercel">
+    Production bound to `main`, previews for everything else, `VITE_*` vars scoped correctly.
+  </Step>
+  <Step title="Cron">
+    `chore-daily-job` and `reminder-notifications` scheduled against each backend you care about.
+  </Step>
+  <Step title="Smoke test both">
+    Sign up, create a flat, enable push, and receive a `test-push` on staging and on production.
+  </Step>
+</Steps>

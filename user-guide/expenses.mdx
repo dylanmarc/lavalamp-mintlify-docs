@@ -1,0 +1,96 @@
+---
+title: "Expenses"
+description: "Split bills, track who owes who, and settle up with both sides confirming."
+noindex: true
+---
+
+Log what you paid, FlatApp works out who owes what, and settling up needs both people to confirm - so the record everyone is looking at is one everyone has agreed to.
+
+## Adding an expense
+
+Tap **+** on the **Expenses** screen.
+
+| Field | |
+| --- | --- |
+| **Title** | "Groceries", "Power bill", "Wifi" |
+| **Amount** | The total paid |
+| **Paid by** | Who actually paid. Can be someone other than you |
+| **Split with** | Who else is sharing it |
+| **Category** | For filtering later |
+| **Notes** | Optional |
+
+<Warning>
+  **"Split with" means the other people, not everyone.** A $30 shop you paid for, split with two flatmates, is $10 each across all three of you - you are automatically included. Adding yourself to the list makes it a four-way split and the numbers will be wrong.
+</Warning>
+
+## Even and itemised splits
+
+**Even** divides the total equally across you and everyone in **Split with**.
+
+**Itemised** lets you set a different amount per person, for the supermarket trip where one person's half was mostly beer. Switch it on and enter each person's share; FlatApp checks the parts add up to the total.
+
+## Balances
+
+The **Balances** tab shows where you stand.
+
+| | |
+| --- | --- |
+| **You owe** | Total you owe others |
+| **You are owed** | Total others owe you |
+| **Net balance** | The single number that matters |
+| **Per person** | Broken down by flatmate |
+
+Where you both owe each other, FlatApp nets it off. You owe Sam $40 and Sam owes you $15, so it shows $25 and you make one transfer instead of two.
+
+## Settling up
+
+Money moves outside FlatApp - bank transfer, cash, whatever you use. FlatApp records that it happened, and it takes both of you.
+
+<Steps>
+  <Step title="Pay them for real">
+    Bank transfer or cash. FlatApp does not move money.
+  </Step>
+  <Step title="Mark it in the app">
+    **Balances** → select what you are settling → **Settle Selected**. Add a note if it helps ("bank transfer Tuesday").
+  </Step>
+  <Step title="They confirm">
+    A **Pending Confirmations** banner appears at the top of their Expenses tab. They tap **Confirm Payment**.
+  </Step>
+  <Step title="Done">
+    Once everyone involved has confirmed, the expense is marked settled for good.
+  </Step>
+</Steps>
+
+<Note>
+  The two-sided confirmation is deliberate. Only one person can see the money arrive, so only they can confirm it did. It also means nobody can quietly mark a debt as paid.
+</Note>
+
+### Confirming a payment
+
+When someone pays you, the banner appears at the top of **Expenses** and the **Expenses** menu item gets a badge. Tap **Confirm Payment** on each. You can confirm several at once.
+
+Everyone's view updates live, so the person who paid sees your confirmation as it happens.
+
+## Finding things
+
+Filter by category, by who paid, and by settled or unsettled. You only ever see expenses you are actually part of.
+
+## Questions people ask
+
+<AccordionGroup>
+  <Accordion title="Someone paid but has not marked it">
+    Ask them to record it in FlatApp. You cannot confirm a payment that was never submitted.
+  </Accordion>
+  <Accordion title="I made a mistake on a settlement">
+    Settlements cannot be deleted - that is what makes the history trustworthy. Add a correcting expense instead, with a note explaining it.
+  </Accordion>
+  <Accordion title="The split is a cent out">
+    Splitting $10 three ways cannot come out even. FlatApp handles the rounding consistently so balances stay correct across many expenses, even when a single one looks a cent off.
+  </Accordion>
+  <Accordion title="Someone is leaving and still owes money">
+    Settle before they leave. Leaving a flat does not clear a balance, and chasing it afterwards is much harder.
+  </Accordion>
+  <Accordion title="Can I log an expense someone else paid?">
+    Yes. Set **Paid by** to them. FlatApp records that you entered it.
+  </Accordion>
+</AccordionGroup>
